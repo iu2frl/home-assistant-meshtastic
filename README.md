@@ -5,7 +5,7 @@ SPDX-FileCopyrightText: 2025 Ylian Saint-Hilaire @ylianst
 SPDX-License-Identifier: MIT
 -->
 
-# Home-Assistant Meshtastic Integration
+# Patched Home-Assistant Meshtastic Integration
 
 [![GitHub Release][releases-shield]][releases]
 [![License][license-shield]](LICENSE)
@@ -32,20 +32,19 @@ Supported Features:
 
 For more details, see check the [documentation](#documentation).
 
+## Why the patch?
+
+The original code at [meshtastic/home-assistant](https://github.com/meshtastic/home-assistant) sits abandoned since June 2026, with a lot of warnings and instabilities. I derived this repo from [Gooman-rus/home-assistant-meshtastic](https://github.com/Gooman-rus/home-assistant-meshtastic) which updated the serial library from the old deprecated one.
+
+I will try to mantain this code working and possibly integrating more features.
+
 ## Installation
 
-### Recommended: [HACS](https://www.hacs.xyz)
-
-1. Add this repository as a custom repository to HACS: [![Add Repository](https://my.home-assistant.io/badges/hacs_repository.svg)](https://my.home-assistant.io/redirect/hacs_repository/?owner=meshtastic&repository=home-assistant&category=integration)
-2. Use HACS to install the integration.
-3. Restart Home Assistant.
-4. Set up the integration using the UI: [![Add Integration](https://my.home-assistant.io/badges/config_flow_start.svg)](https://my.home-assistant.io/redirect/config_flow_start/?domain=meshtastic)
-
-### Alternatives
-<details>
-<summary>Alternatives</summary>
+> [!NOTE]
+> At the moment, I am not interested in having fully automated integration support, manual installation is ok for now.
 
 ### Manual
+
 1. Using the tool of choice open the directory (folder) for your HA configuration (where you find `configuration.yaml`).
 2. If you do not have a `custom_components` directory (folder) there, you need to create it.
 3. In the `custom_components` directory (folder) create a new folder called `homeassistant-meshtastic`.
