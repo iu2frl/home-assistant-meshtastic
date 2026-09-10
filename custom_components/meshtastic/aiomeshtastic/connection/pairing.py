@@ -195,7 +195,11 @@ async def pairing_agent(pin: str) -> AsyncIterator[object]:
         msg = f"Could not connect to the system D-Bus: {e}"
         raise PairingUnavailableError(msg) from e
 
+    # Setup only. Exceptions raised by the caller's `async with` body must NOT be caught here:
+    # doing so reported a failed pair() as "Could not register a BlueZ pairing agent", which sent
+    # debugging in entirely the wrong direction.
     registered = False
+    manager = None
     try:
         bus.export(path, agent)
         introspection = await bus.introspect(BLUEZ_SERVICE, BLUEZ_ROOT_PATH)
@@ -218,21 +222,29 @@ async def pairing_agent(pin: str) -> AsyncIterator[object]:
                 "If pairing fails, close any interactive bluetoothctl session and retry.",
                 e,
             )
-
-        yield agent
     except PairingUnavailableError:
+        await _release_agent(bus, manager, path, agent, registered=registered)
         raise
     except Exception as e:
+        await _release_agent(bus, manager, path, agent, registered=registered)
         msg = f"Could not register a BlueZ pairing agent: {e}"
         raise PairingUnavailableError(msg) from e
+
+    try:
+        yield agent
     finally:
-        if registered:
-            with contextlib.suppress(Exception):
-                await manager.call_unregister_agent(path)
+        await _release_agent(bus, manager, path, agent, registered=registered)
+
+
+async def _release_agent(bus: object, manager: object, path: str, agent: object, *, registered: bool) -> None:
+    """Unregister the agent and drop the bus connection, ignoring teardown failures."""
+    if registered and manager is not None:
         with contextlib.suppress(Exception):
-            bus.unexport(path, agent)
-        with contextlib.suppress(Exception):
-            bus.disconnect()
+            await manager.call_unregister_agent(path)
+    with contextlib.suppress(Exception):
+        bus.unexport(path, agent)
+    with contextlib.suppress(Exception):
+        bus.disconnect()
 
 
 @asynccontextmanager

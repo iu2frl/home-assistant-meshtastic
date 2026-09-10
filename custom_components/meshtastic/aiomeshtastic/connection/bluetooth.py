@@ -155,7 +155,22 @@ class BluetoothConnection(ClientApiConnection):
 
         await self._ensure_paired()
 
-        self._ble_meshtastic_service = self._bleak_client.services[BluetoothConnection.BTM_SERVICE_UUID]
+        try:
+            self._ble_meshtastic_service = self._bleak_client.services[BluetoothConnection.BTM_SERVICE_UUID]
+        except bleak.BleakError as e:
+            # bleak 3.x raises "Service Discovery has not been performed yet" here. On a
+            # Meshtastic node that means BlueZ never resolved the GATT table, which is what
+            # happens when the link is not bonded - the node keeps its services behind
+            # authentication. Report that instead of the bare bleak message.
+            self._logger.warning(
+                "Could not read the GATT table of %s (%s). This node keeps its services behind "
+                "pairing, so this usually means it is not bonded: check the bluetooth PIN, and "
+                "note that bluetooth.mode = RANDOM_PIN cannot work with a stored PIN.",
+                self._ble_address,
+                e,
+            )
+            self._force_fresh_services = True
+            raise BluetoothConnectionError from e
 
         if self._ble_meshtastic_service is None:
             # The peer answered but exposes no Meshtastic service: a non-Meshtastic device at
@@ -195,10 +210,17 @@ class BluetoothConnection(ClientApiConnection):
         bond on file, so this is cheap on every reconnect after the first.
         """
         if self._pin:
+            consulted = False
             try:
                 async with pairing_agent(self._pin) as agent:
-                    await asyncio.wait_for(self._bleak_client.pair(), timeout=PAIR_TIMEOUT)
-                    if agent.was_consulted.is_set():
+                    try:
+                        await asyncio.wait_for(self._bleak_client.pair(), timeout=PAIR_TIMEOUT)
+                    finally:
+                        # Captured either way: whether BlueZ actually asked us for the passkey is
+                        # the difference between "the PIN was wrong" and "our agent was never
+                        # consulted", and the two need completely different fixes.
+                        consulted = agent.was_consulted.is_set()
+                    if consulted:
                         self._logger.info("Bonded with %s using the configured PIN", self._ble_address)
             except PairingUnavailableError as e:
                 # No system D-Bus (Bluetooth proxy, or a container without it mounted). An
@@ -209,8 +231,26 @@ class BluetoothConnection(ClientApiConnection):
                     "'bluetoothctl' - see the integration documentation.",
                     e,
                 )
-            except Exception:  # noqa: BLE001
-                self._logger.warning("Pairing with PIN failed for %s", self._ble_address, exc_info=True)
+            except Exception as e:  # noqa: BLE001
+                if consulted:
+                    self._logger.warning(
+                        "Pairing with %s failed even though BlueZ accepted our PIN (%s: %s). The node "
+                        "rejected it. With bluetooth.mode = RANDOM_PIN the node invents a new PIN for "
+                        "every attempt, so a stored PIN can never match - set the node to FIXED_PIN "
+                        "(or NO_PIN) and configure that value here.",
+                        self._ble_address,
+                        type(e).__name__,
+                        e,
+                    )
+                else:
+                    self._logger.warning(
+                        "Pairing with %s failed and BlueZ never asked us for the PIN (%s: %s). Another "
+                        "pairing agent is most likely holding the default slot - close any interactive "
+                        "bluetoothctl session and retry.",
+                        self._ble_address,
+                        type(e).__name__,
+                        e,
+                    )
             else:
                 # The equivalent of 'bluetoothctl trust': lets the node reconnect later without
                 # any agent being registered, which is what survives a Home Assistant restart.
