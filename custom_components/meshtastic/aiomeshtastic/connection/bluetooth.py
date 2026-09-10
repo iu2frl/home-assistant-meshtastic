@@ -58,6 +58,11 @@ class BluetoothConnection(ClientApiConnection):
     BTM_CHARACTERISTIC_FROM_NUM_UUID = "ed9da18c-a800-4f66-a670-aa7547e34453"
     BTM_CHARACTERISTIC_LOG_UUID = "5a3d6e49-06e6-4423-9944-e9de8cdf9547"
 
+    # A "connect" faster than this did not establish a link: BlueZ attached us to one that was
+    # already open. Real BLE connection setup plus GATT discovery takes hundreds of milliseconds
+    # at an absolute minimum.
+    ATTACHED_LINK_SECONDS = 0.2
+
     def __init__(  # noqa: PLR0913
         self,
         ble_address: str,
@@ -86,6 +91,9 @@ class BluetoothConnection(ClientApiConnection):
         # Set after a GATT failure so the next connect rediscovers services instead of trusting
         # BlueZ's cache, whose handles may be stale.
         self._force_fresh_services = False
+        # How long the last _connect() took. A few milliseconds means we attached to a link that
+        # already existed rather than establishing one, which changes what a read failure means.
+        self._last_connect_duration: float | None = None
 
     def _resolve_ble_device(self) -> Any | None:
         """
@@ -163,6 +171,7 @@ class BluetoothConnection(ClientApiConnection):
         # Only cleared once we have a usable service handle, so a failed attempt keeps forcing
         # rediscovery on the next try.
         self._force_fresh_services = False
+        self._last_connect_duration = elapsed()
 
         self._ble_from_radio = self._ble_meshtastic_service.get_characteristic(
             BluetoothConnection.BTM_CHARACTERISTIC_FROM_RADIO_UUID
@@ -399,6 +408,22 @@ class BluetoothConnection(ClientApiConnection):
                 type(e).__name__,
                 e,
             )
+            if self._last_connect_duration is not None and self._last_connect_duration < self.ATTACHED_LINK_SECONDS:
+                # Connecting took milliseconds, so BlueZ handed us an already-open link instead
+                # of establishing one. Our Disconnect() only drops our own reference, so while
+                # another client holds that link we cannot rebuild it - and every read on it
+                # fails. This has to be cleared on the host, so say so rather than retrying
+                # silently forever.
+                self._logger.warning(
+                    "The connection to %s was already open (established in %.0fms), so it is held "
+                    "by something else and cannot be reset from Home Assistant. Every read on it "
+                    "fails. Clear it on the host - stop Home Assistant, run 'bluetoothctl "
+                    "disconnect %s' and confirm 'Connected: no', restart the bluetooth service if "
+                    "it stays connected, or power-cycle the node to drop the link from its end.",
+                    self._ble_address,
+                    self._last_connect_duration * 1000,
+                    self._ble_address,
+                )
             raise BluetoothConnectionError from e
         finally:
             # The client may already be gone (disconnected concurrently), and BlueZ happily
