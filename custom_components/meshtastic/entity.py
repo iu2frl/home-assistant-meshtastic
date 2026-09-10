@@ -43,7 +43,10 @@ class MeshtasticEntity(Entity):
         self._attr_unique_id = f"{config_entry_id}_{meshtastic_class}_{node}"
         if meshtastic_id is not None:
             self._attr_unique_id += f"_{meshtastic_id}"
-        self._attr_device_info = DeviceInfo(identifiers={(DOMAIN, str(node))})
+        self._attr_device_info = DeviceInfo(
+            identifiers={(DOMAIN, str(node))},
+            config_entry_id=config_entry_id
+        )
         self._attr_device_class = meshtastic_class
 
     @property
