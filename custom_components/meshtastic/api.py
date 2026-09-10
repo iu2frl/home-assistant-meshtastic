@@ -103,6 +103,8 @@ class MeshtasticApiClient:
     READY_TIMEOUT = 30
     # Time budget for tearing everything down; Home Assistant's shutdown window is finite.
     DISCONNECT_TIMEOUT = 10
+    # At or below this RSSI a BLE link still connects but struggles to sustain a bulk transfer.
+    WEAK_RSSI_DBM = -80
 
     def __init__(
         self,
@@ -118,6 +120,7 @@ class MeshtasticApiClient:
         self._hass = hass
         self._config_entry_id = config_entry_id
         self._config_timeout = self.CONFIG_TIMEOUT if config_timeout is None else config_timeout
+        self._ble_address: str | None = None
 
         connection_type = data[CONF_CONNECTION_TYPE]
 
@@ -125,6 +128,7 @@ class MeshtasticApiClient:
             connection = AioTcpConnection(host=data[CONF_CONNECTION_TCP_HOST], port=data[CONF_CONNECTION_TCP_PORT])
         elif connection_type == ConnectionType.BLUETOOTH.value:
             ble_address = data[CONF_CONNECTION_BLUETOOTH_ADDRESS]
+            self._ble_address = ble_address
             connection = AioBluetoothConnection(
                 ble_address=ble_address,
                 # Resolved lazily on every (re)connect: a BLEDevice captured once at setup time
@@ -168,7 +172,41 @@ class MeshtasticApiClient:
 
         return provider
 
+    def _log_bluetooth_signal(self) -> None:
+        """
+        Report the node's signal strength before attempting the config download.
+
+        A weak link still connects and bonds perfectly well, but cannot sustain the throughput
+        needed to stream a large node database - which surfaces only as a timeout, or as opaque
+        BlueZ read errors, with nothing pointing at radio conditions. Saying it up front turns
+        that into something the user can act on.
+        """
+        if self._ble_address is None or not self._hass:
+            return
+        try:
+            from homeassistant.components.bluetooth import async_last_service_info
+
+            service_info = async_last_service_info(self._hass, self._ble_address, connectable=True)
+        except Exception:  # noqa: BLE001
+            self._logger.debug("Could not read bluetooth signal strength", exc_info=True)
+            return
+
+        if service_info is None or service_info.rssi is None:
+            return
+
+        if service_info.rssi <= self.WEAK_RSSI_DBM:
+            self._logger.warning(
+                "Bluetooth signal for %s is weak (%d dBm). The initial config download streams "
+                "the whole node database and may be slow or time out at this signal level. "
+                "Consider moving the node or the adapter closer, or using a bluetooth proxy.",
+                self._ble_address,
+                service_info.rssi,
+            )
+        else:
+            self._logger.debug("Bluetooth signal for %s is %d dBm", self._ble_address, service_info.rssi)
+
     async def connect(self) -> None:
+        self._log_bluetooth_signal()
         try:
             await asyncio.wait_for(self._interface.start(), timeout=self.CONNECT_TIMEOUT)
         except asyncio.CancelledError:
