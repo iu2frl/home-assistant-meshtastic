@@ -481,8 +481,13 @@ class MeshtasticApiClient:
 
         # Recupera il nome del canale
         channels = self._interface.connected_node_channels()
-        channel_info = next((c for c in channels if c.get('index') == packet.channel_index), None)
-        channel_name = channel_info.get('name') if channel_info else None
+        channel_info = None
+        if isinstance(channels, list):
+            for c in channels:
+                if hasattr(c, "get") and c.get("index") == packet.channel_index:
+                    channel_info = c
+                    break
+        channel_name = channel_info.get("name") if channel_info else None
 
         event_data.update({
             "hop_count": packet.mesh_packet.hop_limit,
