@@ -11,7 +11,7 @@ import functools
 import itertools
 import random
 from collections import defaultdict, deque
-from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, MutableMapping
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Mapping, MutableMapping
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType, TracebackType
@@ -80,6 +80,23 @@ class MeshChannel:
     name: str
 
 
+def _deep_update(target: MutableMapping[str, Any], updates: Mapping[str, Any]) -> MutableMapping[str, Any]:
+    """
+    Recursively merge `updates` into `target`.
+
+    Node info arrives as partial protobuf-to-dict conversions, where empty fields are omitted. A
+    plain `dict.update()` would replace a nested record such as `user` wholesale, discarding the
+    names we already knew and leaving downstream consumers with a `user` dict missing keys.
+    """
+    for key, value in updates.items():
+        existing = target.get(key)
+        if isinstance(value, Mapping) and isinstance(existing, MutableMapping):
+            _deep_update(existing, value)
+        else:
+            target[key] = value
+    return target
+
+
 def process_while_running(f):  # noqa: ANN001, ANN201
     @functools.wraps(f)
     async def wrapper(self: "MeshInterface") -> None:
@@ -117,6 +134,11 @@ class MeshInterface:
 
     BROADCAST_NUM: int = 0xFFFFFFFF
     BROADCAST_ADDR = "^all"
+
+    # Teardown budgets. Home Assistant gives integrations a limited window to shut down, so
+    # every step of `stop()` has to be bounded rather than waiting on hardware indefinitely.
+    TASK_CANCEL_TIMEOUT = 5.0
+    DISCONNECT_TIMEOUT = 5.0
 
     def __init__(  # noqa: PLR0913
         self,
@@ -259,23 +281,30 @@ class MeshInterface:
         else:
 
             def matches(node_info: Mapping[str, Any]) -> bool:
-                if user_id is not None and node_info["user"]["id"] == user_id:
+                user = node_info.get("user", {})
+                if user_id is not None and user.get("id") == user_id:
                     return True
-                if short_name is not None and node_info["user"]["shortName"] == short_name:
+                if short_name is not None and user.get("shortName") == short_name:
                     return True
 
-                return bool(long_name is not None and node_info["user"]["longName"] == long_name)
+                return bool(long_name is not None and user.get("longName") == long_name)
 
             node_info = next((node_info for node_info in self._node_database.values() if matches(node_info)), None)
 
         if node_info is None:
             return None
 
+        # Protobuf-to-dict conversion omits empty fields, so a node that has not sent a complete
+        # user record yet arrives without `shortName`/`longName`. Fall back to the same derived
+        # names `stub_node` uses instead of raising and dropping the whole node info packet.
+        node_num = node_info.get("num", node_id)
+        stub = MeshNode.stub_node(node_num)
+        user = node_info.get("user", {})
         return MeshNode(
-            id=node_info["num"],
-            user_id=node_info["user"]["id"],
-            short_name=node_info["user"]["shortName"],
-            long_name=node_info["user"]["longName"],
+            id=node_num,
+            user_id=user.get("id") or stub.user_id,
+            short_name=user.get("shortName") or stub.short_name,
+            long_name=user.get("longName") or stub.long_name,
         )
 
     def find_channel(self, index: int | None = None, name: str | None = None) -> MeshChannel | None:
@@ -331,7 +360,15 @@ class MeshInterface:
         )
 
         async def get_config() -> None:
-            await self._start_config()
+            # Runs detached, so it has to handle its own failures: an unretrieved exception here
+            # was reported by Home Assistant as a bare "Task exception was never retrieved".
+            # Recovery is the reconnect loop's job, which the listener triggers on its own.
+            try:
+                await self._start_config()
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001
+                self._logger.info("Initial config request failed, awaiting reconnect", exc_info=True)
 
         self._add_background_task(get_config(), name="get-config")
 
@@ -339,24 +376,42 @@ class MeshInterface:
             self._add_background_task(self._init_mqtt_client(), name="init-mqtt-client")
 
     async def stop(self) -> None:
-        if not self._is_running.is_set():
-            return
-
+        # Deliberately not short-circuiting on `is_running`: `start()` can be cancelled or time
+        # out after the transport is already open but before the interface is marked running, and
+        # bailing out here used to leave that connection half-open. The next connect attempt then
+        # failed against a link the radio still considered active, which is why a gateway could
+        # pair once and never come back after a restart.
+        was_running = self._is_running.is_set()
         self._is_running.clear()
         self._connected_node_ready.clear()
         self._is_stopped.set()
 
-        await self._close_packet_streams()
-        await self._cancel_processing_tasks()
-        await self._cancel_background_tasks()
+        if was_running:
+            await self._close_packet_streams()
+            # Also release consumers blocked on the transport, so the processing loops leave their
+            # async generators normally instead of being cancelled while suspended inside one.
+            with contextlib.suppress(Exception):
+                self._connection.close_listeners()
+            # One pass over both sets: the previous code cancelled the background tasks twice,
+            # and the second, already-completed pass could only add delay.
+            await self._cancel_tasks(itertools.chain(self._processing_tasks, self._background_tasks))
+            self._processing_tasks.clear()
+            self._background_tasks.clear()
 
-        # MQTT client will be closed automatically when the context manager exits
-        self._mqtt_client = None
-        self._mqtt_connected = False
+            # MQTT client will be closed automatically when the context manager exits
+            self._mqtt_client = None
+            self._mqtt_connected = False
 
+            # Politely tell the radio we are going away. Best-effort only: if the link is already
+            # broken this write cannot succeed, and it must not delay the disconnect below.
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(self._connection.send_disconnect(), timeout=self.DISCONNECT_TIMEOUT)
+
+        # Always close the transport. Bounded, because Home Assistant gives integrations a
+        # limited shutdown window and an unbounded disconnect is what left tasks pending past
+        # the final write stage.
         with contextlib.suppress(Exception):
-            await self._connection.send_disconnect()
-        await self._connection.disconnect()
+            await asyncio.wait_for(self._connection.disconnect(), timeout=self.DISCONNECT_TIMEOUT)
 
     async def _close_packet_streams(self) -> None:
         if not self._packet_stream_listeners:
@@ -366,29 +421,30 @@ class MeshInterface:
             listener.close()
         self._packet_stream_listeners.clear()
 
-    async def _cancel_processing_tasks(self) -> None:
-        if not self._processing_tasks:
+    async def _cancel_tasks(self, tasks: Iterable[asyncio.Task]) -> None:
+        # `stop()` can be called *from* one of these tasks — the reboot handler is a background
+        # task that stops and restarts the interface. Cancelling ourselves there aborted the
+        # teardown halfway and the restart never happened, leaving the gateway unavailable until
+        # Home Assistant was restarted.
+        current = asyncio.current_task()
+        cancellations = [
+            asyncio.create_task(self._cancel_task(t), name=f"cancel-{t.get_name()}")
+            for t in tasks
+            if not t.done() and t is not current
+        ]
+        if not cancellations:
             return
 
-        await asyncio.wait(
-            [
-                asyncio.create_task(self._cancel_task(t), name=f"cancel-{t.get_name()}")
-                for t in itertools.chain(self._processing_tasks, self._background_tasks)
-            ]
-        )
-        self._processing_tasks.clear()
-
-    async def _cancel_background_tasks(self) -> None:
-        if not self._background_tasks:
-            return
-
-        await asyncio.wait(
-            [asyncio.create_task(self._cancel_task(t), name=f"cancel-{t.get_name()}") for t in self._background_tasks]
-        )
+        # A task stuck in an uninterruptible await must not hold up the whole teardown.
+        _done, pending = await asyncio.wait(cancellations, timeout=self.TASK_CANCEL_TIMEOUT)
+        if pending:
+            self._logger.debug("%d task(s) did not finish cancelling in time", len(pending))
+            for t in pending:
+                t.cancel()
 
     async def _cancel_task(self, t: asyncio.Task) -> None:
-        with contextlib.suppress(asyncio.CancelledError):
-            t.cancel()
+        t.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
             await t
 
     @property
@@ -666,7 +722,7 @@ class MeshInterface:
             try:
                 node_info_dict = google.protobuf.json_format.MessageToDict(node_info)
                 db_node = self._get_or_create_node(node_info.num)
-                db_node.update(node_info_dict)
+                _deep_update(db_node, node_info_dict)
 
                 node = self.find_node(node_id) or MeshNode.stub_node(node_id)
                 node_info_packet = FullNodeInfoPacket(packet)
@@ -692,20 +748,27 @@ class MeshInterface:
         return self._create_db_node(node_num)
 
     def _create_db_node(self, node_num: int, node_info: Mapping[str, Any] | None = None) -> MutableMapping[str, Any]:
-        if node_info is None:
-            presumptive_id = f"!{node_num:08x}"
-            n = {
-                "num": node_num,
-                "user": {
-                    "id": presumptive_id,
-                    "longName": f"Meshtastic {presumptive_id[-4:]}",
-                    "shortName": f"{presumptive_id[-4:]}",
-                    "hwModel": "UNSET",
-                },
-            }  # Create a minimal node db entry
-        else:
-            n = {"num": node_num}
-            n.update(node_info)
+        presumptive_id = f"!{node_num:08x}"
+        # Always start from a complete minimal entry and merge the real data over it. Converting
+        # a NodeInfo protobuf to a dict drops fields at their default value, so a node whose
+        # hwModel is UNSET or whose names are empty arrives without those keys entirely.
+        # Consumers all over the integration index into `user` directly, and a missing key there
+        # used to abort node processing or setup with a KeyError.
+        defaults = {
+            "id": presumptive_id,
+            "longName": f"Meshtastic {presumptive_id[-4:]}",
+            "shortName": f"{presumptive_id[-4:]}",
+            "hwModel": "UNSET",
+        }
+        n: MutableMapping[str, Any] = {"num": node_num, "user": dict(defaults)}
+        if node_info is not None:
+            _deep_update(n, node_info)
+            n["num"] = node_num
+            # Backfill anything the radio reported as empty rather than simply omitted.
+            user = n["user"]
+            for key, default in defaults.items():
+                if not user.get(key):
+                    user[key] = default
 
         self._node_database[node_num] = n
 
@@ -750,7 +813,7 @@ class MeshInterface:
                 except Exception:  # noqa: BLE001
                     await self._reconnect_while_running()
 
-    async def _reconnect_while_running(self, *, force: bool = False) -> None:  # noqa: PLR0915
+    async def _reconnect_while_running(self, *, force: bool = False) -> None:
         force_reconnect = force
         reconnect_counter_max = 6
         reconnect_counter = -1
@@ -792,10 +855,12 @@ class MeshInterface:
                         self._logger.debug("Reconnect connection succeeded, requesting config")
 
                     try:
-                        await asyncio.wait_for(self._connection.request_config(minimal=self.no_nodes), timeout=60)
-                        if not self._connected_node_ready.is_set():
-                            self._logger.debug("Completed first request config as part of reconnect")
-                            self._connected_node_ready.set()
+                        # Go through _start_config rather than requesting the config directly: it
+                        # resets the channel list and node database first. Appending a second copy
+                        # of every channel on each reconnect is what produced duplicate notify
+                        # entities and made channel-by-index lookups point at the wrong channel.
+                        await asyncio.wait_for(self._start_config(), timeout=60)
+                        self._logger.debug("Completed request config as part of reconnect")
                     except TimeoutError:
                         self._logger.debug(
                             "Reconnect requesting config did timeout, forcing next reconnect in %.0f seconds",
@@ -1113,7 +1178,7 @@ class MeshInterface:
         if node_id not in self._node_database:
             return False
 
-        self._node_database[node_id].update(**kwargs)
+        _deep_update(self._node_database[node_id], kwargs)
         await self._notify_node_update(node_id)
         return True
 

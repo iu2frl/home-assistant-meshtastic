@@ -5,7 +5,6 @@
 from __future__ import annotations
 
 import asyncio
-import contextlib
 from copy import deepcopy
 from datetime import timedelta
 from enum import StrEnum
@@ -44,7 +43,7 @@ from .const import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Coroutine, Mapping, MutableMapping
+    from collections.abc import Callable, Coroutine, Mapping, MutableMapping
     from types import MappingProxyType, TracebackType
 
     from google.protobuf.message import Message
@@ -53,7 +52,7 @@ if TYPE_CHECKING:
     from .aiomeshtastic.interface import MeshNode, TelemetryType
     from .aiomeshtastic.packet import Packet
 
-_LOGGER = LOGGER.getChild(__name__)
+_LOGGER = LOGGER.getChild(__name__.rpartition(".")[2])
 
 
 EVENT_MESHTASTIC_API_BASE = f"{DOMAIN}_api"
@@ -88,6 +87,17 @@ class MeshtasticApiClientCommunicationError(
 
 
 class MeshtasticApiClient:
+    # Time budget for opening the transport (BLE/TCP/serial handshake).
+    CONNECT_TIMEOUT = 30
+    # Time budget for the initial config download from the radio. The radio streams its whole
+    # node database here, so this has to be generous, but it must stay bounded: it runs inside
+    # `async_setup_entry` and an unbounded wait blocks Home Assistant startup.
+    CONFIG_TIMEOUT = 45
+    # Time budget for callers that need the config to be present before they can answer.
+    READY_TIMEOUT = 30
+    # Time budget for tearing everything down; Home Assistant's shutdown window is finite.
+    DISCONNECT_TIMEOUT = 10
+
     def __init__(
         self,
         data: MappingProxyType[str, Any],
@@ -107,12 +117,13 @@ class MeshtasticApiClient:
             connection = AioTcpConnection(host=data[CONF_CONNECTION_TCP_HOST], port=data[CONF_CONNECTION_TCP_PORT])
         elif connection_type == ConnectionType.BLUETOOTH.value:
             ble_address = data[CONF_CONNECTION_BLUETOOTH_ADDRESS]
-            ble_device = None
-            if hass:
-                from homeassistant.components.bluetooth import async_ble_device_from_address
-
-                ble_device = async_ble_device_from_address(hass, ble_address, connectable=True)
-            connection = AioBluetoothConnection(ble_address=ble_address, ble_device=ble_device)
+            connection = AioBluetoothConnection(
+                ble_address=ble_address,
+                # Resolved lazily on every (re)connect: a BLEDevice captured once at setup time
+                # goes stale when the adapter resets or the device re-advertises, which is why a
+                # gateway that paired fine could never be reconnected to after a restart.
+                ble_device_provider=self._make_ble_device_provider(ble_address),
+            )
         elif connection_type == ConnectionType.SERIAL.value:
             connection = AioSerialConnection(device=data[CONF_CONNECTION_SERIAL_PORT])
         else:
@@ -138,22 +149,41 @@ class MeshtasticApiClient:
             packet_type=portnums_pb2.PortNum.POSITION_APP, callback=self._on_position, as_dict=True
         )
 
+    def _make_ble_device_provider(self, ble_address: str) -> Callable[[], Any]:
+        def provider() -> Any:
+            if not self._hass:
+                return None
+            from homeassistant.components.bluetooth import async_ble_device_from_address
+
+            return async_ble_device_from_address(self._hass, ble_address, connectable=True)
+
+        return provider
+
     async def connect(self) -> None:
         try:
-            await asyncio.wait_for(self._interface.start(), timeout=30)
+            await asyncio.wait_for(self._interface.start(), timeout=self.CONNECT_TIMEOUT)
+        except asyncio.CancelledError:
+            await self._stop_interface_quietly()
+            raise
         except Exception as e:
+            await self._stop_interface_quietly()
             raise MeshtasticApiClientCommunicationError from e
 
         try:
-            ready = await asyncio.wait_for(self._interface.connected_node_ready(), timeout=60)
+            ready = await asyncio.wait_for(self._interface.connected_node_ready(), timeout=self.CONFIG_TIMEOUT)
             exception = None
+        except asyncio.CancelledError:
+            # Home Assistant cancels setup / config flow steps on shutdown and on timeout. Tearing
+            # the interface down here is what keeps the radio from being left in a half-open state
+            # that the next connection attempt cannot recover from.
+            await self._stop_interface_quietly()
+            raise
         except Exception as e:  # noqa: BLE001
             ready = False
             exception = e
 
         if not ready:
-            with contextlib.suppress(Exception):
-                await self._interface.stop()
+            await self._stop_interface_quietly()
             if exception:
                 raise MeshtasticApiClientCommunicationError from exception
             raise MeshtasticApiClientCommunicationError
@@ -170,30 +200,75 @@ class MeshtasticApiClient:
 
         self._add_background_task(send_time())
 
-    async def disconnect(self) -> None:
+    async def _stop_interface_quietly(self) -> None:
+        """
+        Tear the interface down without letting failures mask the original error.
+
+        The teardown runs in its own task and is shielded, because the common way to get here is
+        our caller being cancelled: awaiting directly would raise `CancelledError` before
+        `stop()` ever ran, and the radio would be left with a half-open connection that the next
+        connect attempt cannot recover from.
+        """
+        task = asyncio.ensure_future(self._interface.stop())
+        # Consume any failure so a cancelled caller does not leave an unretrieved exception behind.
+        task.add_done_callback(lambda t: t.cancelled() or t.exception())
         try:
-            self._packet_processor.cancel()
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            self._logger.debug("Cancelled while stopping interface, teardown continues in background")
+            raise
+        except Exception:  # noqa: BLE001
+            self._logger.debug("Failed to stop interface", exc_info=True)
+
+    async def _await_ready(self) -> bool:
+        """Wait (bounded) for the radio config to be available."""
+        try:
+            return await asyncio.wait_for(self._interface.connected_node_ready(), timeout=self.READY_TIMEOUT)
+        except TimeoutError:
+            self._logger.debug("Timed out waiting for connected node to become ready")
+            return False
+
+    async def disconnect(self) -> None:
+        # Stop the interface first: it closes the packet stream listeners, which lets our own
+        # packet processor finish its `async for` normally instead of being cancelled while
+        # suspended inside an async generator.
+        stop_error: Exception | None = None
+        try:
             await self._interface.stop()
-        except Exception as e:
-            raise MeshtasticApiClientCommunicationError from e
+        except Exception as e:  # noqa: BLE001
+            stop_error = e
+
+        # Previously these were left running: the processor was cancelled but never awaited, and
+        # `send_time` was not cancelled at all, which Home Assistant reported at shutdown as
+        # "Task was destroyed but it is pending".
+        pending = [t for t in (self._packet_processor, *self._background_tasks) if t is not None and not t.done()]
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.wait(pending, timeout=self.DISCONNECT_TIMEOUT)
+        self._packet_processor = None
+        self._background_tasks.clear()
+
+        if stop_error is not None:
+            raise MeshtasticApiClientCommunicationError from stop_error
 
     async def async_get_channels(self) -> list[Mapping[str, Any]]:
-        if not await self._interface.connected_node_ready():
+        if not await self._await_ready():
             return []
-        return [self._message_to_dict(c) for c in self._interface.connected_node_channels()]
+        return [self._message_to_dict(c) for c in self._interface.connected_node_channels() or []]
 
     async def async_get_node_local_config(self) -> dict:
-        if not await self._interface.connected_node_ready():
+        if not await self._await_ready():
             return {}
         return self._message_to_dict(self._interface.connected_node_local_config())
 
     async def async_get_node_module_config(self) -> dict:
-        if not await self._interface.connected_node_ready():
+        if not await self._await_ready():
             return {}
         return self._message_to_dict(self._interface.connected_node_module_config())
 
     async def async_get_own_node(self) -> Mapping[str, Any]:
-        if not await self._interface.connected_node_ready():
+        if not await self._await_ready():
             return {}
         return self.get_own_node()
 
@@ -204,7 +279,7 @@ class MeshtasticApiClient:
         return self._interface.find_node(node_id=node_id)
 
     async def async_get_all_nodes(self) -> Mapping[int, Mapping[str, Any]]:
-        await self._interface.connected_node_ready()
+        await self._await_ready()
         return {node_id: self._transform_node_info(node_info) for node_id, node_info in self._interface.nodes().items()}
 
     def _transform_node_info(self, node_info: Mapping[str, Any]) -> Mapping[str, Any]:

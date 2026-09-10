@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import socket
 from copy import deepcopy
 from typing import TYPE_CHECKING
@@ -53,7 +54,6 @@ from .const import (
 )
 
 if TYPE_CHECKING:
-    import asyncio
     from collections.abc import Mapping
     from typing import Any
 
@@ -65,7 +65,7 @@ if TYPE_CHECKING:
     from homeassistant.core import HomeAssistant
     from homeassistant.data_entry_flow import FlowResult
 
-_LOGGER = LOGGER.getChild(__name__)
+_LOGGER = LOGGER.getChild(__name__.rpartition(".")[2])
 
 
 def _step_user_data_connection_tcp_schema_factory(host: str = "", port: int | None = None) -> vol.Schema:
@@ -267,9 +267,15 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             data = dict(self.data)
             data.update(user_input)
             gateway_node, nodes = await validate_input_for_connection(self.hass, data, no_nodes=no_full_load)
-        except CannotConnectError:
+        except (CannotConnectError, TimeoutError):
+            # The radio not answering in time is the ordinary failure here, not a bug.
             errors["base"] = "cannot_connect"
-        except:  # noqa: E722
+        except asyncio.CancelledError:
+            # Home Assistant cancels in-flight flows on shutdown and when setup times out.
+            # Logging that as an unexpected exception with a full traceback was the noisiest
+            # thing in the logs; cancellation has to propagate so the flow is torn down properly.
+            raise
+        except Exception:  # noqa: BLE001
             _LOGGER.warning("Unexpected exception", exc_info=True)
             errors["base"] = "unknown"
         else:
@@ -482,9 +488,10 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         return await self.async_step_discovery_usb_confirm()
 
     async def async_step_discovery_usb_confirm(self, user_input: dict[str, Any] | None = None) -> ConfigFlowResult:
-        device_name = self._usb_discovery_info.manufacturer
-        if self._usb_discovery_info.description:
-            device_name += " " + self._usb_discovery_info.description
+        # Both fields are optional in UsbServiceInfo; plenty of Meshtastic boards report neither,
+        # so build the name from whatever parts are actually present.
+        name_parts = [self._usb_discovery_info.manufacturer, self._usb_discovery_info.description]
+        device_name = " ".join(part for part in name_parts if part) or "Meshtastic"
         title = f"{device_name} ({self._usb_discovery_info.device})"
         errors: dict[str, str] = {}
 
@@ -608,9 +615,11 @@ class OptionsFlowHandler(config_entries.OptionsFlow):
         if self.nodes is None:
             try:
                 _, self.nodes = await validate_input_for_connection(self.hass, self.config_entry.data)
-            except CannotConnectError:
+            except (CannotConnectError, TimeoutError):
                 errors["base"] = "cannot_connect"
-            except:  # noqa: E722
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001
                 _LOGGER.warning("Unexpected exception", exc_info=True)
                 errors["base"] = "unknown"
 

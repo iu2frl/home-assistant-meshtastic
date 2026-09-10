@@ -5,7 +5,7 @@
 
 import asyncio
 import struct
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Callable
 from contextlib import suppress
 from typing import TYPE_CHECKING, Any
 
@@ -25,6 +25,10 @@ if TYPE_CHECKING:
     from bleak.backends.service import BleakGATTService
 
 
+# The fromNum characteristic carries a single little-endian uint32.
+FROM_NUM_LENGTH = 4
+
+
 class BluetoothConnectionError(ClientApiConnectionError):
     pass
 
@@ -41,32 +45,61 @@ class BluetoothConnection(ClientApiConnection):
     BTM_CHARACTERISTIC_FROM_NUM_UUID = "ed9da18c-a800-4f66-a670-aa7547e34453"
     BTM_CHARACTERISTIC_LOG_UUID = "5a3d6e49-06e6-4423-9944-e9de8cdf9547"
 
+    # Pairing can block for a long time on BlueZ when the peer is unresponsive. It is best-effort
+    # anyway, so it must never be allowed to hold up the rest of the connection setup.
+    PAIR_TIMEOUT = 15.0
+
     def __init__(
         self,
         ble_address: str,
         ble_device: Any | None = None,
         bleak_client_backend: type[BaseBleakClient] | None = None,
         connect_timeout: float = 10.0,
+        ble_device_provider: Callable[[], Any | None] | None = None,
     ) -> None:
         super().__init__()
         self._ble_address = ble_address
         self._ble_device = ble_device
+        self._ble_device_provider = ble_device_provider
         self._bleak_client_backend = bleak_client_backend
         self._connect_timeout = connect_timeout
+        self._bleak_client: BleakClient | None = None
         self._ble_meshtastic_service: BleakGATTService | None = None
-        self._ble_from_radio: BleakGATTCharacteristic | None
-        self._ble_to_radio: BleakGATTCharacteristic | None
-        self._ble_from_num: BleakGATTCharacteristic | None
-        self._ble_log: BleakGATTCharacteristic | None
+        self._ble_from_radio: BleakGATTCharacteristic | None = None
+        self._ble_to_radio: BleakGATTCharacteristic | None = None
+        self._ble_from_num: BleakGATTCharacteristic | None = None
+        self._ble_log: BleakGATTCharacteristic | None = None
         self._write_lock = asyncio.Lock()
         self._last_packet_number = None
         self._force_read_event = asyncio.Event()
 
+    def _resolve_ble_device(self) -> Any | None:
+        """
+        Look up the current BLEDevice for our address.
+
+        A BLEDevice is only valid for as long as the adapter keeps its backing connection state.
+        After a Home Assistant restart, a Bluetooth adapter reset, or the node re-advertising, a
+        device object captured earlier is stale and connecting through it fails with obscure
+        BlueZ errors, so re-resolve on every attempt and only fall back to the cached object.
+        """
+        if self._ble_device_provider is not None:
+            with suppress(Exception):
+                device = self._ble_device_provider()
+                if device is not None:
+                    self._ble_device = device
+                    return device
+            self._logger.debug("Could not resolve current BLE device for %s", self._ble_address)
+        return self._ble_device
+
     async def _connect(self) -> None:
-        if self._ble_device is not None:
+        # Drop any previous client so a failed attempt can never leave a stale one behind for
+        # `is_connected` to report on.
+        self._bleak_client = None
+        ble_device = self._resolve_ble_device()
+        if ble_device is not None:
             self._bleak_client = await establish_connection(
                 client_class=BleakClient,
-                device=self._ble_device,
+                device=ble_device,
                 name=self._ble_address,
                 max_attempts=3,
             )
@@ -81,7 +114,7 @@ class BluetoothConnection(ClientApiConnection):
         # able to fully pair with bleak see https://github.com/hbldh/bleak/issues/1434.
         # possible workaround: https://technotes.kynetics.com/2018/pairing_agents_bluez/
         try:
-            await self._bleak_client.pair()
+            await asyncio.wait_for(self._bleak_client.pair(), timeout=self.PAIR_TIMEOUT)
         except:  # noqa: E722
             self._logger.debug("Pairing failed", exc_info=True)
 
@@ -102,14 +135,20 @@ class BluetoothConnection(ClientApiConnection):
         self._ble_log = self._ble_meshtastic_service.get_characteristic(BluetoothConnection.BTM_CHARACTERISTIC_LOG_UUID)
 
     async def _disconnect(self) -> None:
+        client = self._bleak_client
+        self._bleak_client = None
+        if client is None:
+            return
         try:
-            await self._bleak_client.disconnect()
+            await asyncio.wait_for(client.disconnect(), timeout=self._connect_timeout)
         except:  # noqa: E722
             self._logger.debug("Disconnecting failed", exc_info=True)
 
     @property
     def is_connected(self) -> bool:
-        return self._bleak_client.is_connected
+        # Reported before the first connect and after a failed one, so it has to tolerate the
+        # client being absent rather than raising AttributeError into the reconnect loop.
+        return self._bleak_client is not None and self._bleak_client.is_connected
 
     async def _handle_notify_wait(  # noqa: PLR0913
         self,
@@ -164,10 +203,16 @@ class BluetoothConnection(ClientApiConnection):
     async def _packet_stream(self) -> AsyncGenerator[mesh_pb2.FromRadio, Any]:  # noqa: PLR0915
         if not self.is_connected:
             return
+        # Bound to a local: a concurrent disconnect clears the attribute, and the stream must fail
+        # with a connection error rather than an AttributeError on None.
+        client = self._bleak_client
         packet_num_queue = asyncio.Queue()
         force_read_event = self._force_read_event
 
         def notification_handler(_: BleakGATTCharacteristic, data: bytearray) -> None:
+            if len(data) != FROM_NUM_LENGTH:
+                self._logger.debug("Ignoring unexpected fromNum notification of %d bytes", len(data))
+                return
             nums = struct.unpack("<I", data)
             num = nums[0]
 
@@ -181,12 +226,10 @@ class BluetoothConnection(ClientApiConnection):
         try:
 
             async def start_notify() -> None:
-                await asyncio.wait_for(
-                    self._bleak_client.start_notify(self._ble_from_num, notification_handler), timeout=30
-                )
+                await asyncio.wait_for(client.start_notify(self._ble_from_num, notification_handler), timeout=30)
 
             async def stop_notify() -> None:
-                await asyncio.wait_for(self._bleak_client.stop_notify(self._ble_from_num), timeout=30)
+                await asyncio.wait_for(client.stop_notify(self._ble_from_num), timeout=30)
 
             async def restart_notify() -> None:
                 try:
@@ -202,7 +245,7 @@ class BluetoothConnection(ClientApiConnection):
             notify_timeout_duration = 300
             max_notify_timeouts_before_restart = 2
             while True:
-                packet = await self._bleak_client.read_gatt_char(self._ble_from_radio)
+                packet = await client.read_gatt_char(self._ble_from_radio)
                 if not isinstance(packet, bytes):
                     packet = bytes(packet)
                 if packet == b"":
@@ -237,11 +280,14 @@ class BluetoothConnection(ClientApiConnection):
         except bleak.BleakError as e:
             raise BluetoothConnectionError from e
         finally:
-            with suppress(bleak.BleakError):
-                await self._bleak_client.stop_notify(self._ble_from_num)
+            # The client may already be gone (disconnected concurrently), and BlueZ happily
+            # raises on stop_notify for a dropped link — neither should mask the real error.
+            with suppress(Exception):
+                if client.is_connected:
+                    await client.stop_notify(self._ble_from_num)
 
     async def _send_packet(self, data: bytes) -> bool:
-        if not self._bleak_client.is_connected:
+        if not self.is_connected:
             raise ClientApiNotConnectedError
 
         # Check if this packet requires a forced read

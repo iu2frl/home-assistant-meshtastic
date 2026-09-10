@@ -164,16 +164,27 @@ async def _add_channel_entities(
         return
 
     gateway = await config_entry.runtime_data.client.async_get_own_node()
+    if not gateway:
+        LOGGER.debug("Gateway node not available, skipping channel notify entities")
+        return
     channels = await config_entry.runtime_data.client.async_get_channels()
-    entities = [
-        MeshtasticChannelNotify(channel, gateway_node_id=gateway["num"])
-        for channel in channels
-        if channel["role"] != "DISABLED"
-    ]
+    # Channels are keyed by a hash of their PSK, so two channels sharing a PSK map to one entity.
+    # Merging them here keeps Home Assistant from rejecting the batch over a duplicate unique ID.
+    entities: dict[str, MeshtasticChannelNotify] = {}
+    for channel in channels:
+        if channel["role"] == "DISABLED":
+            continue
+        entity = MeshtasticChannelNotify(channel, gateway_node_id=gateway["num"])
+        existing = entities.get(entity.unique_id)
+        if existing is not None:
+            existing.update_from(entity)
+        else:
+            entities[entity.unique_id] = entity
+
     platform = entity_platform.async_get_current_platform()
     entity_registry = er.async_get(hass)
     new_entities = []
-    for e in entities:
+    for e in entities.values():
         registered_entity_id = entity_registry.async_get_entity_id(platform.domain, platform.platform_name, e.unique_id)
         if registered_entity_id is None or registered_entity_id not in platform.domain_entities:
             new_entities.append(e)

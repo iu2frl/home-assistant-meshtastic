@@ -58,9 +58,20 @@ class ClientApiConnection:
         except Exception as e:
             raise ClientApiConnectFailedError from e
 
-    async def disconnect(self) -> None:
-        for listener in self._packet_stream_listeners:
+    def close_listeners(self) -> None:
+        """
+        Close every packet stream listener.
+
+        Consumers blocked in `listen()` then unwind through `StopAsyncIteration` on their own.
+        Letting them finish that way before anything is cancelled avoids cancelling a task while
+        it is suspended inside an async generator, which surfaces as
+        "aclose(): asynchronous generator is already running" during shutdown.
+        """
+        for listener in list(self._packet_stream_listeners):
             listener.close()
+
+    async def disconnect(self) -> None:
+        self.close_listeners()
 
         try:
             await self._disconnect()
@@ -176,13 +187,17 @@ class ClientApiConnection:
             except:  # noqa: E722
                 self._logger.warning("Listener notify failed: %s", listener, exc_info=True)
 
+        listeners = list(self._packet_stream_listeners)
+        if not listeners:
+            # `asyncio.wait([])` raises ValueError, which used to tear down the whole packet
+            # stream whenever a packet arrived in the window after the last listener detached.
+            return
+
         if sequential:
-            for listener in self._packet_stream_listeners:
+            for listener in listeners:
                 await notify(listener, packet)
         else:
-            await asyncio.wait(
-                [asyncio.create_task(notify(listener, packet)) for listener in self._packet_stream_listeners]
-            )
+            await asyncio.wait([asyncio.create_task(notify(listener, packet)) for listener in listeners])
 
     async def _close_packet_stream_listeners(self) -> None:
         for listener in self._packet_stream_listeners:

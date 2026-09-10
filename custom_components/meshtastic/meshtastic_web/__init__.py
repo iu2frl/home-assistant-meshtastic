@@ -32,7 +32,7 @@ from ..const import (  # noqa: TID252
 if TYPE_CHECKING:
     from ..data import MeshtasticConfigEntry  # noqa: TID252
 
-_LOGGER = LOGGER.getChild(__name__)
+_LOGGER = LOGGER.getChild(__name__.rpartition(".")[2])
 
 
 class MeshtasticWebApiContext:

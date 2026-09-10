@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import datetime
 from collections import defaultdict
 from collections.abc import Callable
@@ -140,6 +141,15 @@ async def async_setup_entry(
         raise ConfigEntryNotReady from e
 
     gateway_node = await client.async_get_own_node()
+    if not gateway_node or "num" not in gateway_node:
+        # The radio connected but never delivered its own node info. Every step below indexes
+        # into it, so fail the setup cleanly and let Home Assistant retry instead of raising a
+        # KeyError halfway through creating devices and entities.
+        with contextlib.suppress(Exception):
+            await client.disconnect()
+        msg = "Connected to gateway but did not receive its node info"
+        raise ConfigEntryNotReady(msg)
+
     entry.runtime_data = MeshtasticData(
         client=client,
         integration=async_get_loaded_integration(hass, entry.domain),
@@ -271,7 +281,9 @@ async def _setup_meshtastic_device(  # noqa: PLR0913
         identifiers={(DOMAIN, str(node_id))},
         name=node["user"]["longName"],
         model=device_hardware_names.get(node["user"]["hwModel"], None),
-        model_id=node["user"]["hwModel"],
+        # hwModel is an int when the protobuf enum value is unknown to us; the device registry
+        # requires a string and will stop accepting anything else in HA 2026.12.
+        model_id=str(node["user"]["hwModel"]),
         serial_number=node["user"]["id"],
         via_device=via_device,
         sw_version=client.metadata.get("firmwareVersion")
@@ -342,10 +354,13 @@ async def async_unload_entry(
     entry: MeshtasticConfigEntry,
 ) -> bool:
     # ensure that we disconnect first to prevent later issues with duplicate connection in case of errors
+    runtime_data = getattr(entry, "runtime_data", None)
     try:
-        if entry.runtime_data and entry.runtime_data.client:
-            await entry.runtime_data.client.disconnect()
-    except:  # noqa: E722
+        if runtime_data and runtime_data.client:
+            await runtime_data.client.disconnect()
+    except asyncio.CancelledError:
+        LOGGER.debug("Cancelled while disconnecting client during unload of entry")
+    except Exception:  # noqa: BLE001
         LOGGER.warning("Failed to disconnect client during unload of entry", exc_info=True)
 
     unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)

@@ -21,11 +21,11 @@ from homeassistant.components.sensor import (
 )
 from homeassistant.config import callback
 from homeassistant.const import (
-    CONCENTRATION_MICROGRAMS_PER_CUBIC_METER,
     DEGREE,
     LIGHT_LUX,
     PERCENTAGE,
     SIGNAL_STRENGTH_DECIBELS,
+    UnitOfDensity,
     UnitOfElectricCurrent,
     UnitOfElectricPotential,
     UnitOfLength,
@@ -48,6 +48,10 @@ if TYPE_CHECKING:
 
     from .coordinator import MeshtasticDataUpdateCoordinator
     from .data import MeshtasticConfigEntry, MeshtasticData
+
+# `homeassistant.const.CONCENTRATION_MICROGRAMS_PER_CUBIC_METER` is deprecated and is removed in
+# HA 2027.8; importing it emits a warning on every startup.
+CONCENTRATION_MICROGRAMS_PER_CUBIC_METER = UnitOfDensity.MICROGRAMS_PER_CUBIC_METER
 
 
 def _build_sensors(nodes: Mapping[int, Mapping[str, Any]], runtime_data: MeshtasticData) -> Iterable[MeshtasticSensor]:
