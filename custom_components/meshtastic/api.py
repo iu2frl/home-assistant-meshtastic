@@ -476,15 +476,24 @@ class MeshtasticApiClient:
             to_channel = None
             to_node = packet.to_id
 
+        from_node_id = packet.from_id
+        to_node_id = to_node
+
+        # Resolve readable names for from/to nodes
+        from_name = self._resolve_node_name(from_node_id)
+        to_name = self._resolve_node_name(to_node_id) if to_node_id is not None else None
+
         event_data = self._build_event_data(
             node.id,
             {
-                "from": packet.from_id,
-                "to": {"node": to_node, "channel": to_channel},
+                "from": from_node_id,
+                "to": {"node": to_node_id, "channel": to_channel},
                 "gateway": self.get_own_node()["num"],
                 "message": packet.app_payload,
                 "snr": packet.rx_snr,
                 "rssi": packet.rx_rssi,
+                "from_name": from_name,
+                "to_name": to_name,
             },
         )
 
@@ -508,6 +517,21 @@ class MeshtasticApiClient:
         })
         event_data["message_id"] = packet.mesh_packet.id
         self._hass.bus.async_fire(EVENT_MESHTASTIC_API_TEXT_MESSAGE, event_data)
+
+    def _resolve_node_name(self, node_id: int | None) -> str | None:
+        """Resolve a node ID to a readable name (longName or shortName)."""
+        if node_id is None:
+            return None
+        node_info = self._interface.find_node(node_id=node_id)
+        if node_info is None:
+            return f"!{node_id:08x}"
+        long_name = node_info.long_name or ""
+        short_name = node_info.short_name or ""
+        if long_name:
+            return long_name
+        if short_name:
+            return short_name
+        return f"!{node_id:08x}"
 
     async def _on_telemetry(self, node: MeshNode, telemetry: dict[str, Any]) -> None:
         device_metrics = telemetry.get("deviceMetrics")
