@@ -454,6 +454,9 @@ async def _add_entities_for_entry(hass: HomeAssistant, entities: list[Entity], e
             device = device_registry.async_get_device(identifiers=e.device_info["identifiers"])
             if device:
                 device_id = device.id
+                # Ensure device is associated with this config entry
+                if entry.entry_id not in device.config_entries:
+                    device_registry.async_update_device(device.id, add_config_entry_id=entry.entry_id)
         try:
             entity_registry.async_update_entity(e.entity_id, config_entry_id=entry.entry_id, device_id=device_id)
         except:  # noqa: E722
