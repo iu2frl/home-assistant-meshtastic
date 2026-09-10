@@ -38,6 +38,11 @@ The original code at [meshtastic/home-assistant](https://github.com/meshtastic/h
 
 I will try to mantain this code working and possibly integrating more features.
 
+## Credits
+
+- [meshtastic/home-assistant](https://github.com/meshtastic/home-assistant): Original repository for the Home Assistant integration with Meshtastic.
+- [Gooman-rus/home-assistant-meshtastic](https://github.com/Gooman-rus/home-assistant-meshtastic): Updated the serial library from the old deprecated one.
+
 ## Installation
 
 > [!NOTE]
