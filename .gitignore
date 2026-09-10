@@ -23,3 +23,6 @@ config/*
 
 # build
 .build
+
+# logs
+*_logs.txt
