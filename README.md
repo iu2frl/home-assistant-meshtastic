@@ -334,22 +334,26 @@ it is still busy with receiving / sending other mesh messages.
 alias: Risposta automatica canale Test
 description: Rispondi con timestamp e hop count ai messaggi sul canale Test
 triggers:
-  - event_type: meshtastic_api_text_message
+  - trigger: event
+    event_type: meshtastic_api_text_message
     event_data:
       channel_name: Test
-    trigger: event
 actions:
-  - data:
-      message: >
-        🤖 Ricevuto!
+  - action: meshtastic.send_text
+    data:
+      text: >
+        🤖 Ciao {{ trigger.event.data.data.from_name }}!
 
-        Timestamp: {{ as_timestamp(now()) |
-        timestamp_custom('%Y-%m-%dT%H:%M:%S') }}
+        Sei stato ricevuto da Verona il {{ now().strftime('%Y-%m-%d') alle {{ now().strftime('%H:%M:%S') locali.
+        }}
 
-        Hop count: {{ trigger.event.data.hop_count }}
-      destination: '{{ trigger.event.data.data.from }}'
+        Con {{ trigger.event.data.hop_count | default('N/D') }} hop(s)!
+
+        SNR: {{ trigger.event.data.data.snr }}dB, RSSI: {{ trigger.event.data.data.rssi }}dBm
+      # Aggiungendo il "to" viene inviato come messaggio diretto
+      #to: '{{ trigger.event.data.data.from }}'
       channel: '{{ trigger.event.data.data.to.channel }}'
-    action: meshtastic.send_text
+      ack: true
 mode: single
 ```
 </details>
