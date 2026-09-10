@@ -489,6 +489,9 @@ class MeshtasticApiClient:
                     break
         channel_name = channel_info.settings.name if channel_info and channel_info.settings else None
 
+        if not channel_name and packet.channel_index == 0:
+            channel_name = "Default"
+
         event_data.update({
             "hop_count": packet.mesh_packet.hop_limit,
             "channel_id": packet.channel_index,
