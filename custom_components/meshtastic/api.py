@@ -484,10 +484,10 @@ class MeshtasticApiClient:
         channel_info = None
         if isinstance(channels, list):
             for c in channels:
-                if hasattr(c, "get") and c.get("index") == packet.channel_index:
+                if c.index == packet.channel_index:
                     channel_info = c
                     break
-        channel_name = channel_info.get("name") if channel_info else None
+        channel_name = channel_info.settings.name if channel_info and channel_info.settings else None
 
         event_data.update({
             "hop_count": packet.mesh_packet.hop_limit,
