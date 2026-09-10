@@ -110,7 +110,9 @@
       "invalid_bluetooth_pin": "The bluetooth PIN must be up to 6 digits."
     },
     "abort": {
-      "already_configured": "Meshtastic device is already configured"
+      "already_configured": "Meshtastic device is already configured",
+      "reconfigure_successful": "Connection details updated",
+      "wrong_device": "That is a different Meshtastic node than the one this entry was set up for. Add it as a new gateway instead of reconfiguring this one."
     }
   },
   "options": {

@@ -190,7 +190,7 @@ async def pairing_agent(pin: str) -> AsyncIterator[object]:
     path = f"/org/meshtastic/ha/agent/{os.getpid()}_{id(agent):x}"
 
     try:
-        bus = await message_bus(bus_type.SYSTEM).connect()
+        bus = await message_bus(bus_type=bus_type.SYSTEM).connect()
     except Exception as e:
         msg = f"Could not connect to the system D-Bus: {e}"
         raise PairingUnavailableError(msg) from e
@@ -239,7 +239,7 @@ async def pairing_agent(pin: str) -> AsyncIterator[object]:
 async def _system_bus() -> AsyncIterator[object]:
     """Connect to the system bus for the duration of the context."""
     bus_type, _variant, message_bus, _si, _dm = _import_dbus()
-    bus = await message_bus(bus_type.SYSTEM).connect()
+    bus = await message_bus(bus_type=bus_type.SYSTEM).connect()
     try:
         yield bus
     finally:

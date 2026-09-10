@@ -317,8 +317,21 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             _LOGGER.warning("Unexpected exception", exc_info=True)
             errors["base"] = "unknown"
         else:
-            # Checks that the device is actually unique, otherwise abort
             await self.async_set_unique_id(str(gateway_node["num"]))
+
+            if self.source == config_entries.SOURCE_RECONFIGURE:
+                # Reconfiguring an existing gateway: save the new connection details against the
+                # entry we were opened for and reload it. Falling through to the node-selection
+                # steps below (and to `_abort_if_unique_id_configured`) meant a reconfigure
+                # either aborted as "already configured" or silently re-showed the form, which
+                # looked like the button doing nothing.
+                self._abort_if_unique_id_mismatch(reason="wrong_device")
+                return self.async_update_reload_and_abort(
+                    self._get_reconfigure_entry(),
+                    data_updates=user_input,
+                )
+
+            # Checks that the device is actually unique, otherwise abort
             self._abort_if_unique_id_configured(updates=user_input)
 
             self.gateway_node = gateway_node
@@ -620,8 +633,9 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         return OptionsFlowHandler(config_entry)
 
     async def async_step_reconfigure(self, user_input: dict[str, Any] | None = None) -> FlowResult:  # noqa: ARG002
-        config_entry = self.hass.config_entries.async_get_entry(self.context.get("entry_id"))
+        config_entry = self._get_reconfigure_entry()
 
+        # Prefill the form with the stored connection details (address, port, PIN, ...).
         self.data.update(config_entry.data)
         connection_type = config_entry.data[CONF_CONNECTION_TYPE]
         if connection_type == ConnectionType.TCP.value:

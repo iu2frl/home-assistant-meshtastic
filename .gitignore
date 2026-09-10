@@ -25,4 +25,4 @@ config/*
 .build
 
 # logs
-*_logs.txt
+*_logs*.txt
