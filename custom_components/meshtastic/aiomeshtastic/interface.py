@@ -316,7 +316,9 @@ class MeshInterface:
             return None
 
         if index is not None:
-            if len(self._connected_node_channels) < index:
+            # `len(channels) < index` let index == len through and then raised IndexError on the
+            # lookup below, e.g. asking for channel 3 of 3.
+            if index >= len(self._connected_node_channels or []):
                 return None
 
             channel = self._connected_node_channels[index]
@@ -602,7 +604,7 @@ class MeshInterface:
         elif packet.HasField("metadata"):
             self._connected_node_metadata = packet.metadata
         elif packet.HasField("channel"):
-            self._connected_node_channels.append(packet.channel)
+            self._store_connected_node_channel(packet.channel)
         elif packet.HasField("queueStatus"):
             self._connected_node_queue_status = packet.queueStatus
         elif packet.HasField("log_record"):
@@ -613,6 +615,28 @@ class MeshInterface:
             self._process_connected_node_module_config(packet.moduleConfig)
         elif packet.HasField("mqttClientProxyMessage"):
             await self._handle_mqtt_client_proxy_message(packet.mqttClientProxyMessage)
+
+    def _store_connected_node_channel(self, channel: channel_pb2.Channel) -> None:
+        """
+        Store a channel by its index, replacing any previous entry for that index.
+
+        The radio re-sends every channel slot on each config download, so appending meant a
+        second copy of every channel after a reconnect: duplicate notify entities that Home
+        Assistant rejected, and `find_channel(index=...)` indexing into the wrong entry. A
+        channel deleted on the radio arrives as role DISABLED and replaces the stale entry, so
+        this stays correct without having to clear the list.
+        """
+        if self._connected_node_channels is None:
+            self._connected_node_channels = []
+
+        for position, existing in enumerate(self._connected_node_channels):
+            if existing.index == channel.index:
+                self._connected_node_channels[position] = channel
+                break
+        else:
+            self._connected_node_channels.append(channel)
+
+        self._connected_node_channels.sort(key=lambda c: c.index)
 
     def _process_connected_node_config(self, config: config_pb2.Config) -> None:
         if config.HasField("device"):
@@ -855,11 +879,10 @@ class MeshInterface:
                         self._logger.debug("Reconnect connection succeeded, requesting config")
 
                     try:
-                        # Go through _start_config rather than requesting the config directly: it
-                        # resets the channel list and node database first. Appending a second copy
-                        # of every channel on each reconnect is what produced duplicate notify
-                        # entities and made channel-by-index lookups point at the wrong channel.
-                        await asyncio.wait_for(self._start_config(), timeout=60)
+                        # initial=False keeps the accumulated node database and the ready flag,
+                        # so a reconnect part-way through a large download does not discard the
+                        # progress made so far or flap every entity to unavailable.
+                        await asyncio.wait_for(self._start_config(initial=False), timeout=60)
                         self._logger.debug("Completed request config as part of reconnect")
                     except TimeoutError:
                         self._logger.debug(
@@ -882,14 +905,25 @@ class MeshInterface:
                 self._logger.debug("Reconnecting failed, retrying in %.0f seconds", reconnect_delay)
                 await asyncio.sleep(reconnect_delay)
 
-    async def _start_config(self) -> None:
+    async def _start_config(self, *, initial: bool = True) -> None:
+        """
+        Download the radio's configuration.
+
+        `initial=False` is the reconnect path, and deliberately keeps the node database and the
+        ready flag. A reconnect on a marginal radio link often happens partway through a large
+        node-database download; wiping the accumulated state would throw that progress away and
+        make every entity unavailable, only to restart the same slow download - which on a weak
+        link can repeat indefinitely without ever completing. Channels no longer need clearing
+        either, because they are now stored by index rather than appended.
+        """
         async with self._connected_node_config_lock:
-            self._connected_node_ready.clear()
-            self._connected_node_info: mesh_pb2.MyNodeInfo | None = None
-            self._connected_node_metadata: mesh_pb2.DeviceMetadata | None = None
-            self._connected_node_channels: list[channel_pb2.Channel] | None = []
-            self._connected_node_queue_status: mesh_pb2.QueueStatus | None = None
-            self._node_database = {}
+            if initial:
+                self._connected_node_ready.clear()
+                self._connected_node_info: mesh_pb2.MyNodeInfo | None = None
+                self._connected_node_metadata: mesh_pb2.DeviceMetadata | None = None
+                self._connected_node_channels: list[channel_pb2.Channel] | None = []
+                self._connected_node_queue_status: mesh_pb2.QueueStatus | None = None
+                self._node_database = {}
 
             await self._connection.request_config(minimal=self.no_nodes)
             self._connected_node_ready.set()
