@@ -413,6 +413,12 @@ class MeshtasticApiClient:
         want_ack: bool = False,
         channel_index: int | None = None,
     ) -> bool:
+        self._logger.debug(
+            "send_text: destination=%s channel_index=%s want_ack=%s",
+            destination_id,
+            channel_index,
+            want_ack,
+        )
         try:
             await asyncio.wait_for(
                 self._interface.send_text_message(
@@ -424,10 +430,13 @@ class MeshtasticApiClient:
                 timeout=30,
             )
         except TimeoutError:
+            self._logger.warning("send_text timed out after 30s")
             return False
         except Exception as e:
+            self._logger.warning("send_text failed: %s", e, exc_info=True)
             raise MeshtasticApiClientError from e
         else:
+            self._logger.debug("send_text completed successfully")
             return True
 
     @property

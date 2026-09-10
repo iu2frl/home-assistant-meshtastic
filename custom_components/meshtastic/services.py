@@ -352,6 +352,13 @@ async def _setup_service_send_text_handler(
     hass: HomeAssistant, entry: MeshtasticConfigEntry, client: MeshtasticApiClient
 ) -> None:
     async def handler(call: ServiceCall, to: int, channel_index: int | None) -> None:
+        LOGGER.debug(
+            "send_text service called: to=%s channel_index=%s text='%s' ack=%s",
+            to,
+            channel_index,
+            call.data[ATTR_SERVICE_SEND_TEXT_DATA_TEXT][:50],
+            call.data[ATTR_SERVICE_DATA_ACK],
+        )
         await client.send_text(
             text=call.data[ATTR_SERVICE_SEND_TEXT_DATA_TEXT],
             destination_id=to,
