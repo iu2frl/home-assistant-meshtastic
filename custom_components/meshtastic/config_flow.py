@@ -319,12 +319,15 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             # The radio not answering in time is the ordinary failure here, not a bug.
             errors["base"] = "cannot_connect"
         except asyncio.CancelledError:
-            # Home Assistant cancels in-flight flows on shutdown and when setup times out.
-            # Logging that as an unexpected exception with a full traceback was the noisiest
-            # thing in the logs; cancellation has to propagate so the flow is torn down properly.
+            # Cancellation must propagate so the flow is torn down properly, but it has to leave
+            # a trace: the frontend renders it as a bare "unknown error occurred", and without
+            # this line the log showed nothing at all to explain it.
+            _LOGGER.warning("Connection attempt was cancelled before it completed")
             raise
-        except Exception:  # noqa: BLE001
-            _LOGGER.warning("Unexpected exception", exc_info=True)
+        except Exception as e:  # noqa: BLE001
+            # Type and message go in the message itself, not only in exc_info, so the cause is
+            # visible even in a filtered log view.
+            _LOGGER.warning("Unexpected exception: %s: %s", type(e).__name__, e, exc_info=True)
             errors["base"] = "unknown"
         else:
             await self.async_set_unique_id(str(gateway_node["num"]))

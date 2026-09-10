@@ -183,50 +183,87 @@ class MeshtasticApiClient:
         """
         if self._ble_address is None or not self._hass:
             return
+        # Purely advisory, and it runs before anything else in connect(), so nothing in here may
+        # be allowed to fail the connection.
         try:
             from homeassistant.components.bluetooth import async_last_service_info
 
             service_info = async_last_service_info(self._hass, self._ble_address, connectable=True)
+            rssi = getattr(service_info, "rssi", None) if service_info is not None else None
+            if rssi is None:
+                return
+
+            if rssi <= self.WEAK_RSSI_DBM:
+                self._logger.warning(
+                    "Bluetooth signal for %s is weak (%d dBm). The initial config download streams "
+                    "the whole node database and may be slow or time out at this signal level. "
+                    "Consider moving the node or the adapter closer, or using a bluetooth proxy.",
+                    self._ble_address,
+                    rssi,
+                )
+            else:
+                self._logger.debug("Bluetooth signal for %s is %d dBm", self._ble_address, rssi)
         except Exception:  # noqa: BLE001
             self._logger.debug("Could not read bluetooth signal strength", exc_info=True)
-            return
-
-        if service_info is None or service_info.rssi is None:
-            return
-
-        if service_info.rssi <= self.WEAK_RSSI_DBM:
-            self._logger.warning(
-                "Bluetooth signal for %s is weak (%d dBm). The initial config download streams "
-                "the whole node database and may be slow or time out at this signal level. "
-                "Consider moving the node or the adapter closer, or using a bluetooth proxy.",
-                self._ble_address,
-                service_info.rssi,
-            )
-        else:
-            self._logger.debug("Bluetooth signal for %s is %d dBm", self._ble_address, service_info.rssi)
 
     async def connect(self) -> None:
+        # Each stage is announced with its own timing, so a failure says which stage it failed
+        # in. Previously a connect that died anywhere in here produced a single line at most.
+        loop = asyncio.get_running_loop()
+        started = loop.time()
         self._log_bluetooth_signal()
+
+        self._logger.info(
+            "Connecting to meshtastic device over %s (transport timeout %.0fs)",
+            self._connection_type,
+            self.CONNECT_TIMEOUT,
+        )
         try:
             await asyncio.wait_for(self._interface.start(), timeout=self.CONNECT_TIMEOUT)
         except asyncio.CancelledError:
+            self._logger.warning("Connect cancelled while opening the transport after %.1fs", loop.time() - started)
             await self._stop_interface_quietly()
             raise
+        except TimeoutError as e:
+            self._logger.warning("Opening the transport timed out after %.0fs", self.CONNECT_TIMEOUT)
+            await self._stop_interface_quietly()
+            raise MeshtasticApiClientCommunicationError from e
         except Exception as e:
+            self._logger.warning(
+                "Opening the transport failed after %.1fs: %s: %s", loop.time() - started, type(e).__name__, e
+            )
             await self._stop_interface_quietly()
             raise MeshtasticApiClientCommunicationError from e
 
+        connected_at = loop.time()
+        self._logger.info(
+            "Transport ready after %.1fs, waiting up to %.0fs for the radio config",
+            connected_at - started,
+            self._config_timeout,
+        )
+
         try:
-            self._logger.debug("Waiting up to %.0fs for the radio config", self._config_timeout)
             ready = await asyncio.wait_for(self._interface.connected_node_ready(), timeout=self._config_timeout)
             exception = None
         except asyncio.CancelledError:
             # Home Assistant cancels setup / config flow steps on shutdown and on timeout. Tearing
             # the interface down here is what keeps the radio from being left in a half-open state
             # that the next connection attempt cannot recover from.
+            self._logger.warning(
+                "Connect cancelled while downloading the radio config after %.1fs", loop.time() - connected_at
+            )
             await self._stop_interface_quietly()
             raise
+        except TimeoutError as e:
+            self._logger.warning(
+                "Radio config did not complete within %.0fs - see the 'Still downloading config' "
+                "lines above to tell a slow transfer from a silent radio",
+                self._config_timeout,
+            )
+            ready = False
+            exception = e
         except Exception as e:  # noqa: BLE001
+            self._logger.warning("Radio config failed: %s: %s", type(e).__name__, e)
             ready = False
             exception = e
 
@@ -235,6 +272,12 @@ class MeshtasticApiClient:
             if exception:
                 raise MeshtasticApiClientCommunicationError from exception
             raise MeshtasticApiClientCommunicationError
+
+        self._logger.info(
+            "Connected to meshtastic device in %.1fs (%d nodes known)",
+            loop.time() - started,
+            len(self._interface.nodes()),
+        )
 
         self._packet_processor = asyncio.create_task(self._process_meshtastic_packet())
 

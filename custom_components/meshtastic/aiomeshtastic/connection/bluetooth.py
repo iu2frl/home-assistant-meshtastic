@@ -41,8 +41,13 @@ class BluetoothConnectionError(ClientApiConnectionError):
     pass
 
 
-class BluetoothConnectionServiceNotFoundError:
+class BluetoothConnectionServiceNotFoundError(BluetoothConnectionError):
+    """The peer is connected but does not expose the Meshtastic GATT service."""
+
     def __init__(self) -> None:
+        # Previously this did not derive from Exception at all, so `raise
+        # BluetoothConnectionServiceNotFoundError` produced "TypeError: exceptions must derive
+        # from BaseException" instead of the intended error.
         super().__init__("Bluetooth meshtastic service not found")
 
 
@@ -101,7 +106,17 @@ class BluetoothConnection(ClientApiConnection):
         # Drop any previous client so a failed attempt can never leave a stale one behind for
         # `is_connected` to report on.
         self._bleak_client = None
+        started = asyncio.get_running_loop().time()
+
+        def elapsed() -> float:
+            return asyncio.get_running_loop().time() - started
+
         ble_device = self._resolve_ble_device()
+        self._logger.info(
+            "Connecting to bluetooth device %s (%s)",
+            self._ble_address,
+            "via Home Assistant's bluetooth stack" if ble_device is not None else "by address",
+        )
         if ble_device is not None:
             self._bleak_client = await establish_connection(
                 client_class=BleakClient,
@@ -117,12 +132,23 @@ class BluetoothConnection(ClientApiConnection):
             )
             await self._bleak_client.connect()
 
+        self._logger.info("Bluetooth link to %s established after %.1fs", self._ble_address, elapsed())
+
         await self._ensure_paired()
 
         self._ble_meshtastic_service = self._bleak_client.services[BluetoothConnection.BTM_SERVICE_UUID]
 
         if self._ble_meshtastic_service is None:
+            # The peer answered but exposes no Meshtastic service: a non-Meshtastic device at
+            # this address, or service discovery came back incomplete.
+            self._logger.warning(
+                "Device %s does not expose the meshtastic GATT service (%s)",
+                self._ble_address,
+                BluetoothConnection.BTM_SERVICE_UUID,
+            )
             raise BluetoothConnectionServiceNotFoundError
+
+        self._logger.info("Meshtastic GATT service ready on %s after %.1fs", self._ble_address, elapsed())
 
         self._ble_from_radio = self._ble_meshtastic_service.get_characteristic(
             BluetoothConnection.BTM_CHARACTERISTIC_FROM_RADIO_UUID

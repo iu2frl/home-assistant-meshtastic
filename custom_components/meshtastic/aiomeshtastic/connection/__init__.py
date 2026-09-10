@@ -31,6 +31,9 @@ LOGGER = logging.getLogger(__package__)
 
 class ClientApiConnection:
     _CONFIG_ID_MINIMAL = 69420
+    # First progress report comes early, so a stalled download is visible without waiting out a
+    # full interval; after that, report at a calmer cadence.
+    _CONFIG_FIRST_PROGRESS_DELAY = 3.0
     # How often to report progress while the radio streams its config.
     _CONFIG_PROGRESS_INTERVAL = 10.0
 
@@ -238,51 +241,78 @@ class ClientApiConnection:
         # Progress accounting. A config download that simply takes a long time (a large node
         # database over BLE) and one where the radio never answers at all both used to surface
         # only as a bare TimeoutError from the caller, with no way to tell them apart.
-        started = asyncio.get_running_loop().time()
+        loop = asyncio.get_running_loop()
+        started = loop.time()
         packets = 0
         node_infos = 0
-        last_report = started
 
-        async for packet in self.listen(on_start=self.send_packet(start_config_packet)):
-            try:
-                packets += 1
-                if packet.HasField("node_info"):
-                    node_infos += 1
-
-                now = asyncio.get_running_loop().time()
-                if now - last_report >= self._CONFIG_PROGRESS_INTERVAL:
-                    last_report = now
-                    self._logger.info(
-                        "Still downloading config from radio after %.0fs (%d packets, %d node infos)%s",
-                        now - started,
-                        packets,
-                        node_infos,
-                        " - no packets received yet, another client may be holding the radio's single connection slot"
-                        if packets <= 1
-                        else "",
-                    )
-
-                if (
-                    packet.HasField("config_complete_id")
-                    and packet.config_complete_id == start_config_packet.want_config_id
-                ):
-                    self._logger.info(
-                        "Config download complete in %.1fs (%d packets, %d node infos)",
-                        asyncio.get_running_loop().time() - started,
-                        packets,
-                        node_infos,
-                    )
-                    return True
-            except:  # noqa: E722
-                self._logger.warning("Failed to check request config", exc_info=True)
-
-        self._logger.warning(
-            "Config stream ended before completion after %.1fs (%d packets, %d node infos)",
-            asyncio.get_running_loop().time() - started,
-            packets,
-            node_infos,
+        self._logger.info(
+            "Requesting %s config from radio (want_config_id=%d)",
+            "minimal" if minimal else "full",
+            start_config_packet.want_config_id,
         )
-        return False
+
+        async def report_progress() -> None:
+            """
+            Report progress on a timer, independently of packet arrival.
+
+            Deliberately a separate task: doing this inside the packet loop meant a radio that
+            says nothing at all - the case most in need of an explanation - produced no output
+            whatsoever, because the loop body never ran.
+            """
+            delay = self._CONFIG_FIRST_PROGRESS_DELAY
+            while True:
+                await asyncio.sleep(delay)
+                delay = self._CONFIG_PROGRESS_INTERVAL
+                self._logger.info(
+                    "Still downloading config from radio after %.0fs (%d packets, %d node infos)%s",
+                    loop.time() - started,
+                    packets,
+                    node_infos,
+                    " - nothing received yet, the radio may be out of range or another client may"
+                    " be holding its single connection slot"
+                    if packets == 0
+                    else "",
+                )
+
+        progress_task = asyncio.create_task(report_progress(), name="config-download-progress")
+        try:
+            async for packet in self.listen(on_start=self.send_packet(start_config_packet)):
+                try:
+                    packets += 1
+                    if packet.HasField("node_info"):
+                        node_infos += 1
+
+                    if packets == 1:
+                        # Separates "the radio is not talking to us" from "the radio is talking
+                        # but the transfer is slow" - the two failures look identical otherwise.
+                        self._logger.info("Radio started responding after %.1fs", loop.time() - started)
+
+                    if (
+                        packet.HasField("config_complete_id")
+                        and packet.config_complete_id == start_config_packet.want_config_id
+                    ):
+                        self._logger.info(
+                            "Config download complete in %.1fs (%d packets, %d node infos)",
+                            loop.time() - started,
+                            packets,
+                            node_infos,
+                        )
+                        return True
+                except:  # noqa: E722
+                    self._logger.warning("Failed to check request config", exc_info=True)
+
+            self._logger.warning(
+                "Config stream ended before completion after %.1fs (%d packets, %d node infos)",
+                loop.time() - started,
+                packets,
+                node_infos,
+            )
+            return False
+        finally:
+            progress_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await progress_task
 
     def extract_mesh_packet_data(self, from_radio: mesh_pb2.FromRadio) -> mesh_pb2.Data | None:
         if not from_radio.HasField("packet"):
