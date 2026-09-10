@@ -953,6 +953,38 @@ class MeshInterface:
 
             await self._connection.request_config(minimal=self.no_nodes)
             self._connected_node_ready.set()
+            self._log_channel_table()
+
+    def _log_channel_table(self) -> None:
+        """
+        Report the channel table the radio sent.
+
+        Channels drive the notify targets and the per-channel gateway entities, so when fewer of
+        those appear than expected this is the only way to tell "the radio never sent the
+        channel" apart from "we received it and dropped it later". The key itself is a secret and
+        is never logged, only whether one is set and its length.
+        """
+        channels = self._connected_node_channels or []
+        if not channels:
+            self._logger.warning("Radio reported no channels at all")
+            return
+
+        described = [
+            "#{index} {role} name={name!r} key={key}".format(
+                index=c.index,
+                role=channel_pb2.Channel.Role.Name(c.role),
+                name=c.settings.name,
+                key=f"{len(c.settings.psk)}B" if c.settings.psk else "unset",
+            )
+            for c in channels
+        ]
+        enabled = [c for c in channels if c.role != channel_pb2.Channel.Role.DISABLED]
+        self._logger.info(
+            "Radio reported %d channel slot(s), %d enabled: %s",
+            len(channels),
+            len(enabled),
+            "; ".join(described),
+        )
 
     def _add_background_task(self, coro: Awaitable[None], name: str | None = None) -> asyncio.Task:
         task = asyncio.create_task(coro, name=name)

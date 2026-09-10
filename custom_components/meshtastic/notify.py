@@ -143,10 +143,74 @@ async def _add_node_entities(
         async_add_entities(new_entities)
 
 
+def _channel_key(channel: Mapping[str, Any]) -> bytes:
+    return base64.b64decode(channel.get("settings", {}).get("psk", "") or "")
+
+
+def _channel_name(channel: Mapping[str, Any]) -> str:
+    return channel.get("settings", {}).get("name", "") or ""
+
+
 def _channel_global_id(channel: Mapping[str, Any]) -> str:
+    """
+    Stable identity for a channel, shared across gateways.
+
+    Hashes the key *and* the name. Meshtastic deliberately allows several channels to share one
+    encryption key - regional conventions such as Lora Italia depend on it - and both the
+    Meshtastic app and the radio treat those as separate channels. Hashing the key alone made
+    them indistinguishable, so every channel sharing a key collapsed into a single notification
+    target. Including the name keeps the cross-gateway merge working (the same channel seen
+    through two gateways has the same name and key) while telling sibling channels apart.
+    """
     h = hashlib.blake2b(key=b"global_channel_id", digest_size=16)
-    h.update(base64.b64decode(channel["settings"]["psk"]))
+    h.update(_channel_key(channel))
+    # Separator so that a ("ab", "c") key/name pair cannot hash the same as ("a", "bc").
+    h.update(b"\x00")
+    h.update(_channel_name(channel).encode())
     return base64.b32encode(h.digest()).decode().rstrip("=")
+
+
+def _legacy_channel_global_id(channel: Mapping[str, Any]) -> str:
+    """Compute the key-only identity used before names were included, to migrate old entities."""
+    h = hashlib.blake2b(key=b"global_channel_id", digest_size=16)
+    h.update(_channel_key(channel))
+    return base64.b32encode(h.digest()).decode().rstrip("=")
+
+
+def _channel_unique_id(global_id: str) -> str:
+    return f"meshtastic_channel_{global_id}"
+
+
+@callback
+def _migrate_channel_unique_ids(
+    entity_registry: EntityRegistry, platform: EntityPlatform, channels: list[Mapping[str, Any]]
+) -> None:
+    """
+    Re-point entities created under the old key-only unique id at their name-aware id.
+
+    Without this, changing the identity would orphan the existing notification target and create
+    a replacement alongside it. Several channels can share the old id (that was the bug), so the
+    first one in channel order claims the existing entity and the rest are created fresh.
+    """
+    for channel in channels:
+        legacy_id = _channel_unique_id(_legacy_channel_global_id(channel))
+        new_id = _channel_unique_id(_channel_global_id(channel))
+        if legacy_id == new_id:
+            continue
+
+        legacy_entity_id = entity_registry.async_get_entity_id(platform.domain, platform.platform_name, legacy_id)
+        if legacy_entity_id is None:
+            continue
+        if entity_registry.async_get_entity_id(platform.domain, platform.platform_name, new_id) is not None:
+            # Already migrated, or another channel legitimately owns the new id.
+            continue
+
+        entity_registry.async_update_entity(legacy_entity_id, new_unique_id=new_id)
+        LOGGER.info(
+            "Migrated channel notification target %s to a name-aware id so channels sharing an "
+            "encryption key are no longer merged",
+            legacy_entity_id,
+        )
 
 
 async def _add_channel_entities(
@@ -168,12 +232,13 @@ async def _add_channel_entities(
         LOGGER.debug("Gateway node not available, skipping channel notify entities")
         return
     channels = await config_entry.runtime_data.client.async_get_channels()
-    # Channels are keyed by a hash of their PSK, so two channels sharing a PSK map to one entity.
-    # Merging them here keeps Home Assistant from rejecting the batch over a duplicate unique ID.
+    platform = entity_platform.async_get_current_platform()
+    entity_registry = er.async_get(hass)
+    enabled_channels = [c for c in channels if c["role"] != "DISABLED"]
+    _migrate_channel_unique_ids(entity_registry, platform, enabled_channels)
+
     entities: dict[str, MeshtasticChannelNotify] = {}
-    for channel in channels:
-        if channel["role"] == "DISABLED":
-            continue
+    for channel in enabled_channels:
         entity = MeshtasticChannelNotify(channel, gateway_node_id=gateway["num"])
         existing = entities.get(entity.unique_id)
         if existing is not None:
@@ -181,8 +246,18 @@ async def _add_channel_entities(
         else:
             entities[entity.unique_id] = entity
 
-    platform = entity_platform.async_get_current_platform()
-    entity_registry = er.async_get(hass)
+    if len(enabled_channels) != len(entities):
+        # Only reachable now when two channels share both a key *and* a name, in which case
+        # nothing user-visible distinguishes them.
+        LOGGER.warning(
+            "%d enabled channels produced only %d notification target(s). Channels sharing both "
+            "an encryption key and a name cannot be told apart; give one of them a distinct name.",
+            len(enabled_channels),
+            len(entities),
+        )
+    else:
+        LOGGER.debug("Creating %d channel notification target(s)", len(entities))
+
     new_entities = []
     for e in entities.values():
         registered_entity_id = entity_registry.async_get_entity_id(platform.domain, platform.platform_name, e.unique_id)
