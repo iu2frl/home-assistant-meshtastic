@@ -102,6 +102,33 @@ Two consequences worth knowing:
 
 </details>
 
+### Setup times out ("Failed to connect", or a config download that never finishes)
+
+A Meshtastic node accepts **one client connection at a time**. If the phone app, the web client
+or an interactive `bluetoothctl` session is connected, Home Assistant can open the BLE link but
+the radio will not stream its configuration — setup then fails with a `TimeoutError` waiting for
+the node to become ready. Disconnect any other client and retry.
+
+Otherwise the download may simply be slow: the radio sends its whole node database, which on a
+large mesh over BLE can take minutes. The integration reports progress while it waits, so the
+log distinguishes the two cases:
+
+```
+Still downloading config from radio after 10s (0 packets, 0 node infos) - no packets received
+    yet, another client may be holding the radio's single connection slot
+Still downloading config from radio after 20s (734 packets, 210 node infos)
+Config download complete in 41.2s (1180 packets, 337 node infos)
+```
+
+Rising counts mean it is working and just needs longer; counts stuck at zero mean the radio is
+not talking to us. For the full picture, add this to `configuration.yaml` and restart:
+
+```yaml
+logger:
+  logs:
+    custom_components.meshtastic: debug
+```
+
 ### What happens when Home Assistant restarts or is updated
 
 Bonding keys live with **`bluetoothd`**, in `/var/lib/bluetooth/<adapter-mac>/<node-mac>/`, not

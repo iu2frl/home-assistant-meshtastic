@@ -205,9 +205,19 @@ async def validate_input_for_connection(
             hass=hass,
             config_entry_id=None,
             no_nodes=no_nodes,
+            # Adding a gateway is interactive and one-off: allow the radio far longer to stream
+            # its node database than `async_setup_entry` does, since giving up early only makes
+            # the user restart the same slow download.
+            config_timeout=MeshtasticApiClient.CONFIG_FLOW_CONFIG_TIMEOUT,
         ) as client:
             gateway_node = await client.async_get_own_node()
             nodes = await client.async_get_all_nodes()
+            if "num" not in gateway_node:
+                # Connected, but the radio never told us who it is. Reported as a connection
+                # problem rather than falling through to a KeyError and a generic "unknown".
+                msg = "Connected to the device but it did not report its own node info"
+                _LOGGER.warning(msg)
+                raise CannotConnectError(msg)
             return gateway_node, nodes
     except IntegrationError as e:
         _LOGGER.warning("Failed to connect to meshtastic device", exc_info=True)

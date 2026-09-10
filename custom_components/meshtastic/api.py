@@ -90,10 +90,15 @@ class MeshtasticApiClientCommunicationError(
 class MeshtasticApiClient:
     # Time budget for opening the transport (BLE/TCP/serial handshake).
     CONNECT_TIMEOUT = 30
-    # Time budget for the initial config download from the radio. The radio streams its whole
-    # node database here, so this has to be generous, but it must stay bounded: it runs inside
-    # `async_setup_entry` and an unbounded wait blocks Home Assistant startup.
-    CONFIG_TIMEOUT = 45
+    # Time budget for the initial config download from the radio, which streams the whole node
+    # database. Default sized for `async_setup_entry`, where an unbounded wait blocks Home
+    # Assistant startup and a failure is retried via ConfigEntryNotReady anyway. A large mesh
+    # over BLE can legitimately take minutes, so callers that can afford to wait - notably the
+    # config flow, where the user is watching a spinner - pass a larger `config_timeout`.
+    CONFIG_TIMEOUT = 120
+    # Budget for the config flow: adding a gateway is a one-off, interactive operation, and
+    # failing it early just makes the user retry the same slow download from scratch.
+    CONFIG_FLOW_CONFIG_TIMEOUT = 300
     # Time budget for callers that need the config to be present before they can answer.
     READY_TIMEOUT = 30
     # Time budget for tearing everything down; Home Assistant's shutdown window is finite.
@@ -106,11 +111,13 @@ class MeshtasticApiClient:
         config_entry_id: str | None,
         *,
         no_nodes: bool = False,
+        config_timeout: float | None = None,
     ) -> None:
         self._logger = LOGGER.getChild(self.__class__.__name__)
         self._connected = asyncio.Event()
         self._hass = hass
         self._config_entry_id = config_entry_id
+        self._config_timeout = self.CONFIG_TIMEOUT if config_timeout is None else config_timeout
 
         connection_type = data[CONF_CONNECTION_TYPE]
 
@@ -172,7 +179,8 @@ class MeshtasticApiClient:
             raise MeshtasticApiClientCommunicationError from e
 
         try:
-            ready = await asyncio.wait_for(self._interface.connected_node_ready(), timeout=self.CONFIG_TIMEOUT)
+            self._logger.debug("Waiting up to %.0fs for the radio config", self._config_timeout)
+            ready = await asyncio.wait_for(self._interface.connected_node_ready(), timeout=self._config_timeout)
             exception = None
         except asyncio.CancelledError:
             # Home Assistant cancels setup / config flow steps on shutdown and on timeout. Tearing
