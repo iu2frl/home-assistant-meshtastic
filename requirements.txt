@@ -1,9 +1,18 @@
 colorlog==6.9.0
-homeassistant==2024.11.0
+homeassistant==2026.9.0
 pip>=21.3.1
 ruff==0.11.8
 
-bleak~=0.22.3
+# Pinned to what Home Assistant 2026.9 itself resolves at runtime, so the dev environment
+# exercises the same stack as the integration actually runs against. Installing `homeassistant`
+# alone pulls in none of these: bleak & friends come from the `bluetooth` integration's manifest,
+# and protobuf only appears in homeassistant/package_constraints.txt.
+bleak==3.0.2
+bleak-retry-connector==4.7.0
+# dbus-fast backs the BlueZ pairing agent, see aiomeshtastic/connection/pairing.py
+dbus-fast==5.0.22
+# Must match homeassistant/package_constraints.txt, which constrains protobuf for the wheel.
+protobuf==6.32.0
 serialx==1.8.0
 
 aiomqtt>=1.2.0
