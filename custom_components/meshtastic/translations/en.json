@@ -100,14 +100,15 @@
       }
     },
     "error": {
-      "cannot_connect": "Unable to connect to the device.",
-      "unknown": "Unknown error occurred.",
+      "cannot_connect": "Could not open a connection to the device. Check that it is powered on and in range, and that the address is correct.",
+      "unknown": "Unexpected error. Check the Home Assistant log for a 'custom_components.meshtastic' entry naming the cause. If the attempt was cut short after a minute or two, a reverse proxy or tunnel in front of Home Assistant may be closing the request.",
       "not_meshtastic_device": "Not a Meshtastic device",
       "invalid_node": "Invalid node",
       "invalid_connection_type": "Invalid connection type",
       "reconfigure_not_possible": "Reconfiguration currently not possible",
       "port_in_use": "Port already in use",
-      "invalid_bluetooth_pin": "The bluetooth PIN must be up to 6 digits."
+      "invalid_bluetooth_pin": "The bluetooth PIN must be up to 6 digits.",
+      "radio_not_responding": "Connected to the device, but it did not send its configuration. A Meshtastic node serves only one client at a time — disconnect the phone app, the web client and any 'bluetoothctl' session, then try again. A weak signal or a node that needs restarting can also cause this. Check the Home Assistant log for details."
     },
     "abort": {
       "already_configured": "Meshtastic device is already configured",

@@ -87,6 +87,16 @@ class MeshtasticApiClientCommunicationError(
     """Exception to indicate a communication error."""
 
 
+class MeshtasticApiClientConfigError(MeshtasticApiClientCommunicationError):
+    """
+    The transport opened, but the radio never delivered its configuration.
+
+    Worth distinguishing from a plain communication error: the link is fine, so the remedies are
+    different (another client holding the radio's single connection slot, a weak link, or a node
+    that needs a restart) and the user should be told which of the two happened.
+    """
+
+
 class MeshtasticApiClient:
     # Time budget for opening the transport (BLE/TCP/serial handshake).
     CONNECT_TIMEOUT = 30
@@ -96,9 +106,13 @@ class MeshtasticApiClient:
     # over BLE can legitimately take minutes, so callers that can afford to wait - notably the
     # config flow, where the user is watching a spinner - pass a larger `config_timeout`.
     CONFIG_TIMEOUT = 120
-    # Budget for the config flow: adding a gateway is a one-off, interactive operation, and
-    # failing it early just makes the user retry the same slow download from scratch.
-    CONFIG_FLOW_CONFIG_TIMEOUT = 300
+    # Budget for the config flow. A flow step runs inside an HTTP request, and reverse proxies
+    # and tunnels in front of Home Assistant commonly sever that request somewhere around
+    # 60-120s. When they do, the step is cancelled and the frontend shows its own generic
+    # "unknown error" instead of anything we wrote - so this has to stay *below* that ceiling
+    # for our own diagnosis to be what the user actually sees. Downloads that genuinely need
+    # longer want `async_show_progress`, which is not bound by the request lifetime at all.
+    CONFIG_FLOW_CONFIG_TIMEOUT = 75
     # Time budget for callers that need the config to be present before they can answer.
     READY_TIMEOUT = 30
     # Time budget for tearing everything down; Home Assistant's shutdown window is finite.
@@ -264,8 +278,8 @@ class MeshtasticApiClient:
         if not ready:
             await self._stop_interface_quietly()
             if exception:
-                raise MeshtasticApiClientCommunicationError from exception
-            raise MeshtasticApiClientCommunicationError
+                raise MeshtasticApiClientConfigError from exception
+            raise MeshtasticApiClientConfigError
 
     async def connect(self) -> None:
         # Each stage is announced with its own timing, so a failure says which stage it failed

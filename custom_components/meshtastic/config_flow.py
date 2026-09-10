@@ -25,6 +25,7 @@ from .aiomeshtastic import TcpConnection
 from .aiomeshtastic.connection.pairing import normalise_pin
 from .api import (
     MeshtasticApiClient,
+    MeshtasticApiClientConfigError,
 )
 from .const import (
     BLUETOOTH_PIN_LENGTH,
@@ -213,12 +214,17 @@ async def validate_input_for_connection(
             gateway_node = await client.async_get_own_node()
             nodes = await client.async_get_all_nodes()
             if "num" not in gateway_node:
-                # Connected, but the radio never told us who it is. Reported as a connection
-                # problem rather than falling through to a KeyError and a generic "unknown".
+                # Connected, but the radio never told us who it is. Reported as a radio problem
+                # rather than falling through to a KeyError and a generic "unknown".
                 msg = "Connected to the device but it did not report its own node info"
                 _LOGGER.warning(msg)
-                raise CannotConnectError(msg)
+                raise RadioNotRespondingError(msg)
             return gateway_node, nodes
+    except MeshtasticApiClientConfigError as e:
+        # The link was fine; the radio just never sent its configuration. Different cause,
+        # different remedy, so it must not be reported as "cannot connect".
+        _LOGGER.warning("Connected to the meshtastic device but it did not send its configuration")
+        raise RadioNotRespondingError from e
     except IntegrationError as e:
         _LOGGER.warning("Failed to connect to meshtastic device", exc_info=True)
         raise CannotConnectError from e
@@ -315,6 +321,8 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             data = dict(self.data)
             data.update(user_input)
             gateway_node, nodes = await validate_input_for_connection(self.hass, data, no_nodes=no_full_load)
+        except RadioNotRespondingError:
+            errors["base"] = "radio_not_responding"
         except (CannotConnectError, TimeoutError):
             # The radio not answering in time is the ordinary failure here, not a bug.
             errors["base"] = "cannot_connect"
@@ -322,7 +330,11 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             # Cancellation must propagate so the flow is torn down properly, but it has to leave
             # a trace: the frontend renders it as a bare "unknown error occurred", and without
             # this line the log showed nothing at all to explain it.
-            _LOGGER.warning("Connection attempt was cancelled before it completed")
+            _LOGGER.warning(
+                "Connection attempt was cancelled before it completed. This usually means "
+                "something in front of Home Assistant (a reverse proxy, tunnel or the browser) "
+                "cut the request short."
+            )
             raise
         except Exception as e:  # noqa: BLE001
             # Type and message go in the message itself, not only in exc_info, so the cause is
@@ -664,6 +676,10 @@ class CannotConnectError(HomeAssistantError):
     pass
 
 
+class RadioNotRespondingError(HomeAssistantError):
+    """The transport opened but the radio did not deliver its configuration."""
+
+
 class OptionsFlowHandler(config_entries.OptionsFlow):
     def __init__(self, config_entry: config_entries.ConfigEntry) -> None:  # noqa: ARG002
         self.options = {}
@@ -682,12 +698,14 @@ class OptionsFlowHandler(config_entries.OptionsFlow):
         if self.nodes is None:
             try:
                 _, self.nodes = await validate_input_for_connection(self.hass, self.config_entry.data)
+            except RadioNotRespondingError:
+                errors["base"] = "radio_not_responding"
             except (CannotConnectError, TimeoutError):
                 errors["base"] = "cannot_connect"
             except asyncio.CancelledError:
                 raise
-            except Exception:  # noqa: BLE001
-                _LOGGER.warning("Unexpected exception", exc_info=True)
+            except Exception as e:  # noqa: BLE001
+                _LOGGER.warning("Unexpected exception: %s: %s", type(e).__name__, e, exc_info=True)
                 errors["base"] = "unknown"
 
         if errors:
