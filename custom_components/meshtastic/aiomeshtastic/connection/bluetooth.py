@@ -83,6 +83,9 @@ class BluetoothConnection(ClientApiConnection):
         self._write_lock = asyncio.Lock()
         self._last_packet_number = None
         self._force_read_event = asyncio.Event()
+        # Set after a GATT failure so the next connect rediscovers services instead of trusting
+        # BlueZ's cache, whose handles may be stale.
+        self._force_fresh_services = False
 
     def _resolve_ble_device(self) -> Any | None:
         """
@@ -117,6 +120,10 @@ class BluetoothConnection(ClientApiConnection):
             self._ble_address,
             "via Home Assistant's bluetooth stack" if ble_device is not None else "by address",
         )
+        if self._force_fresh_services:
+            self._logger.info(
+                "Rediscovering GATT services for %s after the previous connection failed", self._ble_address
+            )
         if ble_device is not None:
             self._bleak_client = await establish_connection(
                 client_class=BleakClient,
@@ -125,6 +132,10 @@ class BluetoothConnection(ClientApiConnection):
                 max_attempts=3,
                 # Re-resolved between the retry attempts too, not just before the first one.
                 ble_device_callback=self._resolve_ble_device,
+                # Cached services make reconnects fast, but a cache holding stale handles yields
+                # an instant "Failed to send read request" on every read. After such a failure,
+                # rediscover rather than trusting the cache again.
+                use_services_cache=not self._force_fresh_services,
             )
         else:
             self._bleak_client = BleakClient(
@@ -149,6 +160,9 @@ class BluetoothConnection(ClientApiConnection):
             raise BluetoothConnectionServiceNotFoundError
 
         self._logger.info("Meshtastic GATT service ready on %s after %.1fs", self._ble_address, elapsed())
+        # Only cleared once we have a usable service handle, so a failed attempt keeps forcing
+        # rediscovery on the next try.
+        self._force_fresh_services = False
 
         self._ble_from_radio = self._ble_meshtastic_service.get_characteristic(
             BluetoothConnection.BTM_CHARACTERISTIC_FROM_RADIO_UUID
@@ -376,6 +390,15 @@ class BluetoothConnection(ClientApiConnection):
                 except message.DecodeError:
                     self._logger.warning("Error while parsing FromRadio bytes %s", packet, exc_info=True)
         except bleak.BleakError as e:
+            # The characteristic handles we hold do not work on this link, so do not reuse
+            # BlueZ's cached GATT table on the next attempt.
+            self._force_fresh_services = True
+            self._logger.warning(
+                "Bluetooth read from %s failed (%s: %s); will rediscover services on reconnect",
+                self._ble_address,
+                type(e).__name__,
+                e,
+            )
             raise BluetoothConnectionError from e
         finally:
             # The client may already be gone (disconnected concurrently), and BlueZ happily

@@ -835,7 +835,12 @@ class MeshInterface:
                         if not self.is_running:
                             return
                 except Exception:  # noqa: BLE001
-                    await self._reconnect_while_running()
+                    # force=True is essential: BlueZ can keep reporting a link as connected while
+                    # every GATT operation on it fails instantly with
+                    # "org.bluez.Error.Failed: Failed to send read request". Without forcing,
+                    # `reconnect()` sees is_connected and returns without doing anything, so we
+                    # re-requested the config on a dead link forever instead of rebuilding it.
+                    await self._reconnect_while_running(force=True)
 
     async def _reconnect_while_running(self, *, force: bool = False) -> None:
         force_reconnect = force
