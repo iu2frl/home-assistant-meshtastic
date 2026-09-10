@@ -54,9 +54,9 @@ I will try to mantain this code working and possibly integrating more features.
 7. In the HA UI go to "Configuration" -> "Integrations" click "+" and search for "Meshtastic"
 </details>
 
-### Configuration is done in the UI
+### Configuration
 
-<!---->
+Once the plugin is installed, the device should be automatically discovered, follow the tutorial to complete the connection.
 
 # Documentation
 
