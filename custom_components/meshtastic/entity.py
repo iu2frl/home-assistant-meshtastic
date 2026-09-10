@@ -261,6 +261,7 @@ class MeshtasticNodeEntity(MeshtasticCoordinatorEntity, ABC):
 
         self._attr_device_info = DeviceInfo(
             identifiers={(DOMAIN, str(self.node_id))},
+            config_entry_id=coordinator.config_entry.entry_id,
         )
         self._attr_unique_id = (
             f"{coordinator.config_entry.entry_id}_{platform}_{self.node_id}_{self.entity_description.key}"
