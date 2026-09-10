@@ -123,6 +123,8 @@ class MeshtasticApiClient:
         self._ble_address: str | None = None
 
         connection_type = data[CONF_CONNECTION_TYPE]
+        # Kept for log messages, so a connect failure says which transport it was using.
+        self._connection_type = connection_type
 
         if connection_type == ConnectionType.TCP.value:
             connection = AioTcpConnection(host=data[CONF_CONNECTION_TCP_HOST], port=data[CONF_CONNECTION_TCP_PORT])
@@ -206,13 +208,9 @@ class MeshtasticApiClient:
         except Exception:  # noqa: BLE001
             self._logger.debug("Could not read bluetooth signal strength", exc_info=True)
 
-    async def connect(self) -> None:
-        # Each stage is announced with its own timing, so a failure says which stage it failed
-        # in. Previously a connect that died anywhere in here produced a single line at most.
+    async def _open_transport(self, started: float) -> None:
+        """Open the underlying transport, reporting which stage failed and after how long."""
         loop = asyncio.get_running_loop()
-        started = loop.time()
-        self._log_bluetooth_signal()
-
         self._logger.info(
             "Connecting to meshtastic device over %s (transport timeout %.0fs)",
             self._connection_type,
@@ -235,13 +233,9 @@ class MeshtasticApiClient:
             await self._stop_interface_quietly()
             raise MeshtasticApiClientCommunicationError from e
 
-        connected_at = loop.time()
-        self._logger.info(
-            "Transport ready after %.1fs, waiting up to %.0fs for the radio config",
-            connected_at - started,
-            self._config_timeout,
-        )
-
+    async def _download_config(self, connected_at: float) -> None:
+        """Wait for the radio to finish streaming its configuration."""
+        loop = asyncio.get_running_loop()
         try:
             ready = await asyncio.wait_for(self._interface.connected_node_ready(), timeout=self._config_timeout)
             exception = None
@@ -272,6 +266,23 @@ class MeshtasticApiClient:
             if exception:
                 raise MeshtasticApiClientCommunicationError from exception
             raise MeshtasticApiClientCommunicationError
+
+    async def connect(self) -> None:
+        # Each stage is announced with its own timing, so a failure says which stage it failed
+        # in. Previously a connect that died anywhere in here produced a single line at most.
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        self._log_bluetooth_signal()
+
+        await self._open_transport(started)
+
+        connected_at = loop.time()
+        self._logger.info(
+            "Transport ready after %.1fs, waiting up to %.0fs for the radio config",
+            connected_at - started,
+            self._config_timeout,
+        )
+        await self._download_config(connected_at)
 
         self._logger.info(
             "Connected to meshtastic device in %.1fs (%d nodes known)",
