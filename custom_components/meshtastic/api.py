@@ -478,7 +478,7 @@ class MeshtasticApiClient:
         )
 
         # Recupera il nome del canale
-        channels = await self._interface.connected_node_channels()
+        channels = self._interface.connected_node_channels()
         channel_info = next((c for c in channels if c.get('index') == packet.channel_index), None)
         channel_name = channel_info.get('name') if channel_info else None
 
