@@ -101,7 +101,7 @@
       "pid": "7523"
     }
   ],
-  "version": "0.6.1",
+  "version": "IU2FRL-0.6.5",
   "zeroconf": [
     "_meshtastic._tcp.local.",
     "_http._tcp.local."
