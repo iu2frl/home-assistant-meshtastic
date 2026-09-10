@@ -477,6 +477,16 @@ class MeshtasticApiClient:
             },
         )
 
+        # Recupera il nome del canale
+        channels = await self._interface.connected_node_channels()
+        channel_info = next((c for c in channels if c.get('index') == packet.channel_index), None)
+        channel_name = channel_info.get('name') if channel_info else None
+
+        event_data.update({
+            "hop_count": packet.mesh_packet.hop_limit,
+            "channel_id": packet.channel_index,
+            "channel_name": channel_name
+        })
         event_data["message_id"] = packet.mesh_packet.id
         self._hass.bus.async_fire(EVENT_MESHTASTIC_API_TEXT_MESSAGE, event_data)
 
