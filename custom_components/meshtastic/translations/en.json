@@ -26,18 +26,25 @@
         }
       },
       "manual_bluetooth": {
-        "description": "Connect Device via Bluetooth.\n**IMPORTANT**: PIN is not supported, please remove it first.\n\nPlease be patient, initial setup takes a while when device has a large node db",
+        "description": "Connect Device via Bluetooth.\n\nIf the node asks for a PIN (firmware default is a random 6-digit PIN shown on the node's screen), enter it below and it will be used to bond with the node. Leave it empty if the node's bluetooth mode is set to `NO_PIN`, or if you have already paired the node manually on the host.\n\nPlease be patient, initial setup takes a while when device has a large node db",
         "data": {
-          "bluetooth_address": "Bluetooth Address"
+          "bluetooth_address": "Bluetooth Address",
+          "bluetooth_pin": "Bluetooth PIN"
         },
         "data_description": {
-          "bluetooth_address": "Device address in form of 00:11:22:33:FF:EE"
+          "bluetooth_address": "Device address in form of 00:11:22:33:FF:EE",
+          "bluetooth_pin": "Optional 6-digit pairing PIN. Shown on the node's screen with the default RANDOM_PIN mode, or configured under Bluetooth as the fixed PIN."
         }
       },
       "discovery_bluetooth_confirm": {
-        "description": "Connect Device via Bluetooth.\n**IMPORTANT**: PIN is not supported, please remove it first.\n\nPlease be patient, initial setup takes a while when device has a large node db",
+        "description": "Connect Device via Bluetooth.\n\nIf the node asks for a PIN (firmware default is a random 6-digit PIN shown on the node's screen), enter it below and it will be used to bond with the node. Leave it empty if the node's bluetooth mode is set to `NO_PIN`, or if you have already paired the node manually on the host.\n\nPlease be patient, initial setup takes a while when device has a large node db",
         "data": {
-          "bluetooth_address": "Bluetooth Address"
+          "bluetooth_address": "Bluetooth Address",
+          "bluetooth_pin": "Bluetooth PIN"
+        },
+        "data_description": {
+          "bluetooth_address": "Device address in form of 00:11:22:33:FF:EE",
+          "bluetooth_pin": "Optional 6-digit pairing PIN. Shown on the node's screen with the default RANDOM_PIN mode, or configured under Bluetooth as the fixed PIN."
         }
       },
       "manual_serial": {
@@ -99,7 +106,8 @@
       "invalid_node": "Invalid node",
       "invalid_connection_type": "Invalid connection type",
       "reconfigure_not_possible": "Reconfiguration currently not possible",
-      "port_in_use": "Port already in use"
+      "port_in_use": "Port already in use",
+      "invalid_bluetooth_pin": "The bluetooth PIN must be up to 6 digits."
     },
     "abort": {
       "already_configured": "Meshtastic device is already configured"

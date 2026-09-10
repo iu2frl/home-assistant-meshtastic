@@ -22,11 +22,14 @@ from homeassistant.helpers.selector import (
 
 from . import CONF_OPTION_WEB_CLIENT, CURRENT_CONFIG_VERSION_MINOR
 from .aiomeshtastic import TcpConnection
+from .aiomeshtastic.connection.pairing import normalise_pin
 from .api import (
     MeshtasticApiClient,
 )
 from .const import (
+    BLUETOOTH_PIN_LENGTH,
     CONF_CONNECTION_BLUETOOTH_ADDRESS,
+    CONF_CONNECTION_BLUETOOTH_PIN,
     CONF_CONNECTION_SERIAL_PORT,
     CONF_CONNECTION_TCP_HOST,
     CONF_CONNECTION_TCP_PORT,
@@ -77,10 +80,14 @@ def _step_user_data_connection_tcp_schema_factory(host: str = "", port: int | No
     )
 
 
-def _step_user_data_connection_bluetooth_schema_factory(address: str = "") -> vol.Schema:
+def _step_user_data_connection_bluetooth_schema_factory(address: str = "", pin: str = "") -> vol.Schema:
     return vol.Schema(
         {
             vol.Required(CONF_CONNECTION_BLUETOOTH_ADDRESS, default=address): cv.string,
+            # Meshtastic firmware defaults to bluetooth.mode = RANDOM_PIN and shows a 6-digit
+            # passkey on the node's screen. Optional, because NO_PIN nodes and nodes already
+            # bonded at the OS level do not need it.
+            vol.Optional(CONF_CONNECTION_BLUETOOTH_PIN, default=pin or vol.UNDEFINED): cv.string,
         }
     )
 
@@ -260,9 +267,40 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
         self._load_nodes_task: asyncio.Task | None = None
 
+    @staticmethod
+    def _normalise_bluetooth_pin(errors: dict[str, str], user_input: dict[str, Any]) -> bool:
+        """
+        Validate and tidy the optional bluetooth PIN in place. Returns False if it is unusable.
+
+        An empty field is removed rather than stored, so that "no PIN" and "PIN of empty string"
+        cannot be confused later on.
+        """
+        if CONF_CONNECTION_BLUETOOTH_PIN not in user_input:
+            return True
+
+        try:
+            pin = normalise_pin(user_input[CONF_CONNECTION_BLUETOOTH_PIN])
+        except ValueError:
+            errors[CONF_CONNECTION_BLUETOOTH_PIN] = "invalid_bluetooth_pin"
+            return False
+
+        if pin is None:
+            user_input.pop(CONF_CONNECTION_BLUETOOTH_PIN, None)
+            return True
+
+        if len(pin) > BLUETOOTH_PIN_LENGTH:
+            errors[CONF_CONNECTION_BLUETOOTH_PIN] = "invalid_bluetooth_pin"
+            return False
+
+        user_input[CONF_CONNECTION_BLUETOOTH_PIN] = pin
+        return True
+
     async def _handle_connection_user_input(
         self, errors: dict[str, str], user_input: dict[str, Any] | None = None, *, no_full_load: bool = False
     ) -> ConfigFlowResult | None:
+        if not self._normalise_bluetooth_pin(errors, user_input):
+            return None
+
         try:
             data = dict(self.data)
             data.update(user_input)
@@ -327,7 +365,8 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         return self.async_show_form(
             step_id="manual_bluetooth",
             data_schema=_step_user_data_connection_bluetooth_schema_factory(
-                self.data.get(CONF_CONNECTION_BLUETOOTH_ADDRESS)
+                self.data.get(CONF_CONNECTION_BLUETOOTH_ADDRESS),
+                self.data.get(CONF_CONNECTION_BLUETOOTH_PIN),
             ),
             errors=errors,
         )
@@ -393,7 +432,8 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         return self.async_show_form(
             step_id="discovery_bluetooth_confirm",
             data_schema=_step_user_data_connection_bluetooth_schema_factory(
-                self.data.get(CONF_CONNECTION_BLUETOOTH_ADDRESS)
+                self.data.get(CONF_CONNECTION_BLUETOOTH_ADDRESS),
+                self.data.get(CONF_CONNECTION_BLUETOOTH_PIN),
             ),
             description_placeholders=self.context["title_placeholders"],
             errors=errors,

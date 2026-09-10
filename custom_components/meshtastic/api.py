@@ -33,6 +33,7 @@ from .aiomeshtastic.errors import MeshRoutingError, MeshtasticError
 from .aiomeshtastic.protobuf import portnums_pb2
 from .const import (
     CONF_CONNECTION_BLUETOOTH_ADDRESS,
+    CONF_CONNECTION_BLUETOOTH_PIN,
     CONF_CONNECTION_SERIAL_PORT,
     CONF_CONNECTION_TCP_HOST,
     CONF_CONNECTION_TCP_PORT,
@@ -123,6 +124,7 @@ class MeshtasticApiClient:
                 # goes stale when the adapter resets or the device re-advertises, which is why a
                 # gateway that paired fine could never be reconnected to after a restart.
                 ble_device_provider=self._make_ble_device_provider(ble_address),
+                pin=data.get(CONF_CONNECTION_BLUETOOTH_PIN),
             )
         elif connection_type == ConnectionType.SERIAL.value:
             connection = AioSerialConnection(device=data[CONF_CONNECTION_SERIAL_PORT])

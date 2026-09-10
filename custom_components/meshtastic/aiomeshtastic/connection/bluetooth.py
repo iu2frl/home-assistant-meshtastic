@@ -20,6 +20,14 @@ from .errors import (
     ClientApiConnectionError,
     ClientApiNotConnectedError,
 )
+from .pairing import (
+    PAIR_TIMEOUT,
+    PairingUnavailableError,
+    async_get_device_state,
+    async_set_device_trusted,
+    normalise_pin,
+    pairing_agent,
+)
 
 if TYPE_CHECKING:
     from bleak.backends.service import BleakGATTService
@@ -45,22 +53,20 @@ class BluetoothConnection(ClientApiConnection):
     BTM_CHARACTERISTIC_FROM_NUM_UUID = "ed9da18c-a800-4f66-a670-aa7547e34453"
     BTM_CHARACTERISTIC_LOG_UUID = "5a3d6e49-06e6-4423-9944-e9de8cdf9547"
 
-    # Pairing can block for a long time on BlueZ when the peer is unresponsive. It is best-effort
-    # anyway, so it must never be allowed to hold up the rest of the connection setup.
-    PAIR_TIMEOUT = 15.0
-
-    def __init__(
+    def __init__(  # noqa: PLR0913
         self,
         ble_address: str,
         ble_device: Any | None = None,
         bleak_client_backend: type[BaseBleakClient] | None = None,
         connect_timeout: float = 10.0,
         ble_device_provider: Callable[[], Any | None] | None = None,
+        pin: str | None = None,
     ) -> None:
         super().__init__()
         self._ble_address = ble_address
         self._ble_device = ble_device
         self._ble_device_provider = ble_device_provider
+        self._pin = normalise_pin(pin)
         self._bleak_client_backend = bleak_client_backend
         self._connect_timeout = connect_timeout
         self._bleak_client: BleakClient | None = None
@@ -102,6 +108,8 @@ class BluetoothConnection(ClientApiConnection):
                 device=ble_device,
                 name=self._ble_address,
                 max_attempts=3,
+                # Re-resolved between the retry attempts too, not just before the first one.
+                ble_device_callback=self._resolve_ble_device,
             )
         else:
             self._bleak_client = BleakClient(
@@ -109,14 +117,7 @@ class BluetoothConnection(ClientApiConnection):
             )
             await self._bleak_client.connect()
 
-        # attempt pairing, we don't know if it is required. Should not harm if
-        # not needed. if pairing is required, external input is necessary as we are not
-        # able to fully pair with bleak see https://github.com/hbldh/bleak/issues/1434.
-        # possible workaround: https://technotes.kynetics.com/2018/pairing_agents_bluez/
-        try:
-            await asyncio.wait_for(self._bleak_client.pair(), timeout=self.PAIR_TIMEOUT)
-        except:  # noqa: E722
-            self._logger.debug("Pairing failed", exc_info=True)
+        await self._ensure_paired()
 
         self._ble_meshtastic_service = self._bleak_client.services[BluetoothConnection.BTM_SERVICE_UUID]
 
@@ -133,6 +134,77 @@ class BluetoothConnection(ClientApiConnection):
             BluetoothConnection.BTM_CHARACTERISTIC_FROM_NUM_UUID
         )
         self._ble_log = self._ble_meshtastic_service.get_characteristic(BluetoothConnection.BTM_CHARACTERISTIC_LOG_UUID)
+
+    async def _ensure_paired(self) -> None:
+        """
+        Bond with the node, supplying the configured PIN if there is one.
+
+        Meshtastic firmware defaults to `bluetooth.mode = RANDOM_PIN` and will not serve the
+        fromRadio/toRadio characteristics over an unauthenticated link. bleak cannot supply a
+        passkey itself (https://github.com/hbldh/bleak/issues/1434), so a PIN means standing up a
+        BlueZ pairing agent for the duration of the pairing. `pair()` is a no-op once BlueZ has a
+        bond on file, so this is cheap on every reconnect after the first.
+        """
+        if self._pin:
+            try:
+                async with pairing_agent(self._pin) as agent:
+                    await asyncio.wait_for(self._bleak_client.pair(), timeout=PAIR_TIMEOUT)
+                    if agent.was_consulted.is_set():
+                        self._logger.info("Bonded with %s using the configured PIN", self._ble_address)
+            except PairingUnavailableError as e:
+                # No system D-Bus (Bluetooth proxy, or a container without it mounted). An
+                # already-bonded node still works, so carry on and let the caller find out.
+                self._logger.warning(
+                    "Cannot supply the bluetooth PIN automatically (%s). "
+                    "If this node is not bonded yet, pair it once from the host with "
+                    "'bluetoothctl' - see the integration documentation.",
+                    e,
+                )
+            except Exception:  # noqa: BLE001
+                self._logger.warning("Pairing with PIN failed for %s", self._ble_address, exc_info=True)
+            else:
+                # The equivalent of 'bluetoothctl trust': lets the node reconnect later without
+                # any agent being registered, which is what survives a Home Assistant restart.
+                await async_set_device_trusted(self._ble_address)
+                return
+
+        # No PIN configured, or the PIN path did not get us bonded. Pairing may still be
+        # unnecessary (bluetooth.mode = NO_PIN) or already done, so attempt it best-effort
+        # exactly as before.
+        try:
+            await asyncio.wait_for(self._bleak_client.pair(), timeout=PAIR_TIMEOUT)
+        except:  # noqa: E722
+            self._logger.debug("Pairing failed", exc_info=True)
+
+        await self._warn_if_not_bonded()
+
+    async def _warn_if_not_bonded(self) -> None:
+        """
+        Say so plainly when BlueZ has no bond, instead of leaving the user with GATT errors.
+
+        Without a bond the node accepts the connection but refuses the fromRadio/toRadio
+        characteristics, which surfaces later as opaque "Failed to send read request" style
+        errors rather than anything pointing at pairing.
+        """
+        state = await async_get_device_state(self._ble_address)
+        if state is None or state.get("Paired"):
+            return
+
+        if self._pin:
+            self._logger.warning(
+                "Node %s is still not paired with BlueZ after trying the configured PIN. "
+                "Check that the PIN matches the one shown on the node's screen "
+                "(bluetooth.mode = RANDOM_PIN generates a new one) and that no interactive "
+                "bluetoothctl session is holding the pairing agent.",
+                self._ble_address,
+            )
+        else:
+            self._logger.warning(
+                "Node %s is not paired with BlueZ and no bluetooth PIN is configured. "
+                "Add the node's PIN in the integration options, or set the node's "
+                "bluetooth.mode to NO_PIN.",
+                self._ble_address,
+            )
 
     async def _disconnect(self) -> None:
         client = self._bleak_client

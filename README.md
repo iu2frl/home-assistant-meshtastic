@@ -63,6 +63,101 @@ I will try to mantain this code working and possibly integrating more features.
 
 Once the plugin is installed, the device should be automatically discovered, follow the tutorial to complete the connection.
 
+## Bluetooth pairing (PIN)
+
+Meshtastic firmware ships with `bluetooth.mode = RANDOM_PIN`: the node shows a fresh 6-digit
+passkey on its screen each time something tries to bond with it, and it will **not** serve the
+`fromRadio` / `toRadio` characteristics over an unauthenticated link. If the node is not bonded,
+the connection itself succeeds but every read fails, typically showing up in the log as
+`org.bluez.Error.Failed: Failed to send read request` or a setup that never becomes available.
+
+Enter the PIN in the **Bluetooth PIN** field when adding the gateway (or in *Reconfigure* on an
+existing one). It is optional — leave it empty if the node uses `NO_PIN`, or if you already
+bonded the node on the host.
+
+<details>
+<summary>How this works, and why it used to need <code>bluetoothctl</code></summary>
+
+BlueZ never asks the *application* for a passkey. It asks whichever process has registered an
+`org.bluez.Agent1` on the system D-Bus as the **default agent**. Neither bleak (its `pair()`
+simply calls BlueZ's `Pair()`, see [bleak#1434](https://github.com/hbldh/bleak/issues/1434)) nor
+Home Assistant's Bluetooth stack registers such an agent — so with a PIN-protected node BlueZ had
+nobody to ask, and pairing could only be done by hand with `bluetoothctl`, which brings its own
+agent.
+
+This integration now registers a minimal pairing agent for the duration of the pairing, answers
+BlueZ's `RequestPasskey` with your PIN, and then marks the device **trusted** (the equivalent of
+`bluetoothctl trust`) so that later reconnects need no agent at all.
+
+Two consequences worth knowing:
+
+* **Close any interactive `bluetoothctl` session** before adding the gateway. Only one default
+  agent can exist at a time; if `bluetoothctl` holds it, ours cannot take over and you will see
+  `Could not become the default BlueZ pairing agent` in the log.
+* **The system D-Bus must be reachable.** With an
+  [ESPHome Bluetooth proxy](https://esphome.io/components/bluetooth_proxy.html) there is no local
+  BlueZ at all, and in a hand-rolled Docker setup the socket may not be mounted. In that case the
+  integration logs `Cannot supply the bluetooth PIN automatically` and falls back to assuming the
+  node is already bonded.
+
+</details>
+
+### What happens when Home Assistant restarts or is updated
+
+Bonding keys live with **`bluetoothd`**, in `/var/lib/bluetooth/<adapter-mac>/<node-mac>/`, not
+inside the integration or its config entry. So what survives depends on where `bluetoothd` runs:
+
+| Install method | `bluetoothd` runs on | Bond survives a restart / update? |
+| --- | --- | --- |
+| Home Assistant OS | the host OS | **Yes** — the Core container is replaced, the host bond store is not |
+| Supervised | the host OS | **Yes** |
+| Container / Docker (host D-Bus mounted) | the host OS | **Yes** |
+| Core in a venv | the host OS | **Yes** |
+| A container running its own `bluetoothd` | inside that container | **No** — an image update discards `/var/lib/bluetooth`, so re-pair (mount a volume there to fix this) |
+
+In the normal cases the PIN is therefore needed **once**. After that the bond and the trust flag
+persist, and restarts reconnect unattended. The PIN is still kept in the config entry so that
+re-pairing is automatic if the bond is ever lost.
+
+A bond *does* get invalidated by: factory-resetting the node, changing its `bluetooth.mode` or
+fixed PIN, `bluetoothctl remove`, moving to a different Bluetooth adapter, or clearing
+`/var/lib/bluetooth`. With the PIN saved, the integration re-bonds by itself — except under
+`RANDOM_PIN`, where the node invents a new passkey and you will have to read it off the screen
+and update the setting. **If you want unattended recovery, set the node's Bluetooth mode to
+`FIXED_PIN`** and configure that PIN here.
+
+<details>
+<summary>Checking and fixing pairing state by hand</summary>
+
+The integration logs the actionable case explicitly (`... is not paired with BlueZ ...`). To
+inspect or repair it yourself, on the machine where `bluetoothd` runs:
+
+```bash
+bluetoothctl info AA:BB:CC:DD:EE:FF   # look for "Paired: yes" and "Trusted: yes"
+```
+
+To start over:
+
+```bash
+bluetoothctl remove AA:BB:CC:DD:EE:FF   # drop the bond, then reload the integration
+```
+
+Pairing manually (the pre-existing workaround, still valid) — note that `trust` is what makes it
+stick across restarts:
+
+```bash
+bluetoothctl
+[bluetooth]# scan on
+[bluetooth]# pair AA:BB:CC:DD:EE:FF     # enter the PIN from the node's screen
+[bluetooth]# trust AA:BB:CC:DD:EE:FF
+[bluetooth]# quit
+```
+
+Then leave the **Bluetooth PIN** field empty, since the bond already exists. Remember to quit
+`bluetoothctl`, or its agent will block the integration's own.
+
+</details>
+
 # Documentation
 
 ## Supported Platforms
