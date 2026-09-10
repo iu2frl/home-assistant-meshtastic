@@ -327,6 +327,33 @@ it is still busy with receiving / sending other mesh messages.
   mode: single
 ```
 
+<details>
+<summary>Automatic reply on specific channels</summary>
+
+```yaml
+alias: Risposta automatica canale Test
+description: Rispondi con timestamp e hop count ai messaggi sul canale Test
+triggers:
+  - event_type: meshtastic_api_text_message
+    event_data:
+      channel_name: Test
+    trigger: event
+actions:
+  - data:
+      message: >
+        🤖 Ricevuto!
+
+        Timestamp: {{ as_timestamp(now()) |
+        timestamp_custom('%Y-%m-%dT%H:%M:%S') }}
+
+        Hop count: {{ trigger.event.data.hop_count }}
+      destination: '{{ trigger.event.data.data.from }}'
+      channel: '{{ trigger.event.data.data.to.channel }}'
+    action: meshtastic.send_text
+mode: single
+```
+</details>
+
 If you don't want to use the recommend notification platform for sending messages (e.g. if you don't want to clutter your Home Assistant instance with potentially hundreds of notify mesh entities), 
 you can still handle incoming text messages from any public node and reply to these messages. 
 This is useful if to want to reply to incoming direct messages with a standard message, use a LLM or handle various commands with automations.
