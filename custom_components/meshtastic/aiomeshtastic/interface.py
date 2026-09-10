@@ -34,6 +34,7 @@ from google.protobuf.message import Message
 
 from .connection import (
     ClientApiConnection,
+    ClientApiConnectionError,
     ClientApiConnectionPacketStreamListener,
     ClientApiNotConnectedError,
 )
@@ -573,10 +574,19 @@ class MeshInterface:
     async def _heartbeat_loop(self) -> None:
         while True:
             await asyncio.sleep(self._heartbeat_interval_s)
+            if self._reconnect_lock.locked():
+                self._logger.debug("Skipping heartbeat during reconnect")
+                continue
+
+            if not self._connection.is_connected:
+                # Probing a link already known to be down can only raise
+                # ClientApiNotConnectedError, which used to be logged with a full traceback for
+                # something entirely expected. Go straight to the reconnect instead.
+                self._logger.debug("Connection is down, reconnecting instead of sending a heartbeat")
+                await self._reconnect_while_running(force=True)
+                continue
+
             try:
-                if self._reconnect_lock.locked():
-                    self._logger.debug("Skipping heartbeat during reconnect")
-                    continue
                 self._logger.debug("Sending heartbeat")
                 if self._connected_node_ready.is_set():
                     # perform request with an actual response from node, self._connection.send_heartbeat() does not
@@ -585,8 +595,19 @@ class MeshInterface:
                 else:
                     # use as fallback when we did not succeed to connect, and we don't have a node id
                     await self._connection.send_heartbeat()
+            except ClientApiConnectionError as e:
+                # The link dropped, possibly between the check above and the probe. This is the
+                # condition the heartbeat exists to detect, so report it in one line.
+                self._logger.info("Heartbeat could not be sent (%s), reconnecting", e)
+                await self._reconnect_while_running(force=True)
+            except (MeshInterfaceRequestError, MeshRoutingError) as e:
+                # The transport is up but the radio did not answer. Also expected on a lossy
+                # link, and also not worth a traceback.
+                self._logger.info("Heartbeat got no usable response (%s), reconnecting", e)
+                await self._reconnect_while_running(force=True)
             except Exception:  # noqa: BLE001
-                self._logger.info("Heartbeat failed, reconnecting", exc_info=True)
+                # Anything else is genuinely unexpected and does warrant the traceback.
+                self._logger.warning("Heartbeat failed unexpectedly, reconnecting", exc_info=True)
                 await self._reconnect_while_running(force=True)
             else:
                 self._logger.debug("Heartbeat success")
