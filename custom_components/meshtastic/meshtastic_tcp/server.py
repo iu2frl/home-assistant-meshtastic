@@ -120,6 +120,16 @@ class MeshtasticTcpProxy:
             peer = writer.transport.get_extra_info("peername", (None, None, None, None))
             peer_name = "{}:{}".format(*peer[0:2])
 
+            # Replay recently received packets so the new client doesn't see an empty chat
+            recent = self._interface.get_recent_packets()
+            if recent:
+                for from_radio in recent:
+                    try:
+                        await client_connection.write_from_radio_packet(from_radio)
+                    except Exception:  # noqa: BLE001
+                        _LOGGER.debug("Failed to replay packet to %s", peer_name, exc_info=True)
+                        break
+
             async def forward_to_radio() -> None:
                 while True:
                     packet = await client_connection.read_to_radio_packet()

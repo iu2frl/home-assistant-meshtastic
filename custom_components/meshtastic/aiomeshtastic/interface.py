@@ -192,6 +192,10 @@ class MeshInterface:
             defaultdict(list)
         )
         self._previous_reconnects = deque(maxlen=10)
+        # Ring buffer of recently received FromRadio packets. Sized to retain enough for a TCP
+        # proxy client to replay when it connects late (e.g. after the initial config download has
+        # already passed). Older packets are dropped as new ones arrive.
+        self._recent_packets: deque[mesh_pb2.FromRadio] = deque(maxlen=500)
 
         # MQTT client for persistent connection
         self._mqtt_proxy_enabled = enable_mqtt_proxy
@@ -715,6 +719,7 @@ class MeshInterface:
                 await listener.notify(from_radio)
 
             await self._process_packet_for_app_listener(from_radio)
+            self._recent_packets.append(from_radio)
 
     async def _process_packet_for_app_listener(self, from_radio: mesh_pb2.FromRadio) -> None:  # noqa: PLR0912
         packet = Packet(from_radio)
@@ -832,6 +837,10 @@ class MeshInterface:
     async def from_radio_stream(self) -> AsyncIterator[mesh_pb2.FromRadio]:
         async for packet in self._listen():
             yield packet
+
+    def get_recent_packets(self) -> list[mesh_pb2.FromRadio]:
+        """Return a snapshot of the most recently received FromRadio packets for replay to late clients."""
+        return list(self._recent_packets)
 
     async def _listen(self) -> AsyncIterator[mesh_pb2.FromRadio]:
         with ClientApiConnectionPacketStreamListener() as listener:
